@@ -1,6 +1,6 @@
 # CMake writes these, and CI writes them again on every run.
 build/
-build-fuzz/
+build-fuzztest/
 .cmake-host/
 compile_commands.json
 
