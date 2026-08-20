@@ -76,3 +76,39 @@ same binary under different names.
 
 These stop processes. They do not stop machines and they do not cut networks, so they
 exercise consensus and recovery but never a partition. That needs two hosts.
+
+## Two faults in these tests, found by running them
+
+Recorded here rather than fixed, because both need a design decision.
+
+**The negative control does not demonstrate what it claims.** Under
+`single` redundancy the zone kill left **all 200 keys readable**. The
+run still "failed", but on a tolerance status line at stage 4, not on
+data loss -- so the suite reports the control failing as required while
+never exercising its mechanism.
+
+Key count is not the variable. **Shard count is.** 200 tiny keys is one
+shard on one storage team, so killing a named zone is a one-in-three
+chance of hitting it. Going from 1 key to 200 changed nothing about
+that; it takes enough data to span several shards, or a kill aimed at
+the team that actually holds them.
+
+Until then, stage 3 of `consensus.sh` is uncontrolled: it is not known
+whether it would catch a store that really did lose data.
+
+**No restore has been proven.** `dr.sh` reaches `Restorable: true` and
+then fails at stage 4, unable to reconfigure after wiping the data
+directories, so the restore never runs. The backup half is exercised
+and the recovery half is not, which is the wrong half to have
+confidence in.
+
+## What these still cannot test
+
+The machine-scale rungs -- stop a machine, lose quorum, recover -- were
+run against three Fly hosts and passed. Those hosts are gone, and the
+procedure was not vendored here.
+
+A **partition** remains untested anywhere. Every rung above stops
+something cleanly. A partition leaves both sides alive and unable to
+see each other, which is the only case where split-brain is possible,
+and stopping a machine never produces it.
