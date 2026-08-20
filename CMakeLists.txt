@@ -70,6 +70,17 @@ add_executable(tpcc EXCLUDE_FROM_ALL tpcc.c)
 target_link_libraries(tpcc PRIVATE weft_fdb_vfs Threads::Threads m)
 add_dependencies(benchmarks bench_vfs tpcc)
 
+# `sqlrun` is a tool, not a test: it runs whatever SQL arrives on stdin and reports rows and
+# elapsed time. It asserts nothing, so it is out of the default build for the same reason the
+# benchmarks are -- and it is separate from them because a benchmark reports a fixed number
+# and this reports whatever was asked.
+#
+#   cmake --build BUILD --target tools
+add_custom_target(tools)
+add_executable(sqlrun EXCLUDE_FROM_ALL sqlrun.c)
+target_link_libraries(sqlrun PRIVATE weft_fdb_vfs)
+add_dependencies(tools sqlrun)
+
 # The harness, as a subtree. It carries the iceoryx2 C ABI as a dlsym table, the shared
 # limits, and the payload types. Nothing here links iceoryx2: the table dlopens it, so the
 # store builds on a machine that has never seen it and fails at start rather than at link.
