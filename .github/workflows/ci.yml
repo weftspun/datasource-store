@@ -82,6 +82,31 @@ jobs:
           CXX: clang++
         run: ./ci.sh fuzz
 
+  # The parallel-commit protocol against the spec it claims to be. Needs Java and the TLA+
+  # tools, and neither FoundationDB nor SQLite: it checks a specification, not a run.
+  tla:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: cache the TLA+ tools
+        uses: actions/cache@v6
+        with:
+          path: ~/.local/lib/tla2tools.jar
+          key: tla2tools-latest
+
+      - name: Install the TLA+ tools
+        run: |
+          mkdir -p ~/.local/lib
+          [ -f ~/.local/lib/tla2tools.jar ] || curl -fsSL -o ~/.local/lib/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+
+      # Runs TLC twice: once on the derived module and once on the vendored authority, and
+      # fails unless the two report the same state counts.
+      - name: The renaming is the same protocol
+        run: ./ci.sh tla
+
   spec:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
