@@ -35,9 +35,22 @@ primary_region = "sjc"
   # without it, TLS encrypts the link and any certificate at all is accepted at the other end
   # -- confidentiality without authentication, which is the weaker half of what TLS is for.
   #
-  # `Check.Valid=1` requires a chain to the CA. `S.CN` pins the subject. Both, because either
-  # alone admits something: a valid certificate for another name, or this name unsigned.
-  WEFT_FDB_TLS_VERIFY = "Check.Valid=1,S.CN=*.chibifire.com"
+  # `Check.Valid=1` requires a chain to the CA. The two `S.CN` terms pin the subject. Both
+  # halves, because either alone admits something: a valid certificate for another name, or
+  # this name unsigned.
+  #
+  # There is no globbing here, and the earlier `S.CN=*.chibifire.com` was a silent no-op
+  # because of it. `flow/TLSConfig.actor.cpp` implements exactly three matchers -- EXACT is a
+  # memcmp of equal lengths, PREFIX and SUFFIX are memcmp at one end -- so `*` is not a
+  # metacharacter but a literal asterisk, and `S.CN=*.chibifire.com` asks for a certificate
+  # whose Common Name is the fourteen characters `*.chibifire.com`. Nothing we issue has that
+  # name, so the rule matched no peer at all. A verification rule that refuses everything
+  # looks exactly like a cluster that cannot find its coordinators.
+  #
+  # `>=` is prefix and `<=` is suffix, which is the doc's own `S.OU>=FDB,S.OU<=Team` shape.
+  # Together they say: the Common Name begins `fdb-` and ends `.chibifire.com`, which is the
+  # whole of what our CA will issue.
+  WEFT_FDB_TLS_VERIFY = "Check.Valid=1,S.CN>=fdb-,S.CN<=.chibifire.com"
 
 [mounts]
   source      = "fdb_data"
