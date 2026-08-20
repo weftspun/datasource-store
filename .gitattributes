@@ -1,0 +1,15 @@
+# Line endings are not cosmetic here. `check_surface.sh` compares the symbols in the built
+# library against `foundationdb.allow` line by line, so a CRLF checkout makes every listed
+# symbol miss its match — and the check then reports the same 19 symbols as both unlisted
+# and unused, which reads as a total surface violation rather than as a checkout artefact.
+# It cost a debugging round on Windows to find that, so the rule is written down instead.
+#
+# Every shell script here is also run under `sh`, which reads `#!/bin/sh\r` as an
+# interpreter named `/bin/sh\r` and reports "bad interpreter".
+*.sh            text eol=lf
+*.allow         text eol=lf
+ci.sh           text eol=lf
+*.c             text eol=lf
+*.h             text eol=lf
+*.cpp           text eol=lf
+*.lean          text eol=lf
