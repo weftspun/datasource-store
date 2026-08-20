@@ -1,8 +1,15 @@
 # Build the store and run the programs that assert something.
 #
-# Two jobs, because they need different things. `test` needs a live FoundationDB, since
-# every program here is a program about a database. `fuzz` needs neither FoundationDB nor
-# SQLite: `fdb_keys.h` is pure, which is why it was split out.
+# Every assertion lives in `ci.sh`, and this file installs what that script refuses to
+# install and then calls it. The steps used to restate the commands, which meant two
+# copies of the commit stage: one a developer runs and one the pipeline runs, drifting
+# apart with nothing comparing them. A green run here over a checkout nobody can reproduce
+# locally is the failure that arrangement produces.
+#
+# Three jobs, because they need different things. `test` needs a live FoundationDB, since
+# every program it runs is a program about a database. `fuzz` needs neither FoundationDB
+# nor SQLite: `fdb_keys.h` is pure, which is why it was split out. `spec` needs Lean and
+# nothing else.
 name: ci
 
 on:
@@ -44,109 +51,14 @@ jobs:
             fdbcli --exec 'status minimal' | grep -q 'The database is available' && break
             sleep 2
           done
-          fdbcli --exec 'status minimal'
 
       - name: Install SQLite headers
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
 
-      - name: Build
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build build -j
-
-      # The store calls the FoundationDB surface it says it calls, and every read is
-      # serializable. `foundationdb.allow` is the list and says why each absence is one.
-      # This needs no cluster: it reads the built library's undefined symbols.
-      - name: The store surface is the one that was argued for
-        run: ./check_surface.sh build
-
-      # A handoff copies nothing. The reader is a different process with no local file, so
-      # this fails if the VFS ever writes one.
-      - name: A handoff copies nothing
-        run: |
-          ./build/prove_handoff write zone-atlantis.db
-          test ! -f zone-atlantis.db || { echo "a local file appeared"; exit 1; }
-          ./build/prove_handoff read zone-atlantis.db
-
-      # SQLite's own audit of its B-tree, over a database that lives in FoundationDB.
-      - name: SQLite checks its own pages
-        run: ./build/integrity zone-atlantis.db
-
-      # The only program that reaches the staging path, where a commit is too large for
-      # one transaction.
-      - name: A commit past one transaction
-        run: ./build/prove_big_commit big.db 2000 8192
-
-      # A grant across two databases lands whole or not at all. This is the parallel commit
-      # protocol: the crash points that matter are between staging the intents and writing
-      # the record, where the group must abort, and between the record and moving the heads,
-      # where it is already implicitly committed and recovery must finish it. Conservation
-      # is the oracle, since integrity_check cannot see two databases disagreeing.
-      # The points start past setup. A writer drops and creates two tables and seeds the
-      # world before the first grant, so a crash below about commit 8 lands in setup and
-      # leaves nothing to conserve. Only a run that reaches a seeded world tests anything,
-      # so the step counts those and fails if none did.
-      - name: A grant is never partial
-        run: |
-          conserved=0
-          for point in 8 10 12 14 17 20 25 30; do
-            echo "=== crash before write transaction $point ==="
-            rc=0
-            out=$(./build/prove_parallel_commit "world-$point.db" "avatar-$point.db" 8 at "$point" 2>&1) || rc=$?
-            echo "$out"
-            if [ "$rc" = 1 ]; then echo "a grant was partial at $point"; exit 1; fi
-            case "$out" in *conserved:*) conserved=$((conserved + 1)) ;; esac
-          done
-          echo "crash points that reached a seeded world: $conserved"
-          if [ "$conserved" = 0 ]; then
-            echo "every crash point landed in setup, so this step asserted nothing"
-            exit 1
-          fi
-
-      # A crash must leave the whole commit or none of it. Walk crash points rather than
-      # one, since the fault lives at a particular point and a single delay rarely lands
-      # inside a commit. The full space is the Lean search in witness/, too long for a
-      # pull request.
-      #
-      # The points start past the setup. A writer drops the table, creates it, and seeds
-      # it before the first round, so a crash below about commit 6 lands in setup and
-      # leaves a database with no rows, where nothing can be torn. Points 1 to 5 passed
-      # here and tested nothing, so the step now starts above them and fails if it never
-      # reaches a seeded database. A green step that asserted nothing is the failure this
-      # suite exists to avoid.
-      - name: A crash leaves no torn commit
-        run: |
-          seeded=0
-          for point in 6 8 10 13 16 21; do
-            echo "=== crash before commit $point ==="
-            # Exit 2 means the crash point was past the end of the sequence, which is not
-            # a fault, so the status has to be captured rather than left to abort the step.
-            rc=0
-            out=$(./build/prove_crash "crash-$point.db" 400 at "$point" 2>&1) || rc=$?
-            echo "$out"
-            # 0 whole, 2 unreached, 1 torn or a failed integrity check.
-            if [ "$rc" = 1 ]; then echo "torn at crash point $point"; exit 1; fi
-            case "$out" in *"rows: 0"*) ;; *"rows: "*) seeded=$((seeded + 1)) ;; esac
-          done
-          echo "crash points that reached a seeded database: $seeded"
-          if [ "$seeded" = 0 ]; then
-            echo "every crash point landed in setup, so this step asserted nothing"
-            exit 1
-          fi
-
-  # The read-ahead window's safety argument. Pure Lean and no dependencies, so this is the
-  # cheapest job here and the only one that checks a proof rather than a run.
-  spec:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - uses: leanprover/lean-action@v1
-        with:
-          lake-package-directory: spec
-          build: true
-          test: false
-          lint: false
+      # `deps` fails rather than skips when FoundationDB is absent, so a broken install
+      # above stops here instead of turning the rest of the run into silent passes.
+      - name: The commit stage
+        run: ./ci.sh deps build surface handoff integrity big-commit parallel-commit crash
 
   fuzz:
     runs-on: ubuntu-24.04
@@ -164,15 +76,45 @@ jobs:
           path: build-fuzz/_deps
           key: fuzztest-${{ hashFiles('fuzz/CMakeLists.txt') }}
 
-      - name: Build the fuzz tests
+      - name: The key properties
         env:
           CC: clang
           CXX: clang++
-        run: |
-          cmake -S fuzz -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build build-fuzz -j
+        run: ./ci.sh fuzz
 
-      # Unit-test mode: every property runs against random inputs for a short budget. This
-      # gates a pull request. Hunting for a counterexample over hours is a separate run.
-      - name: Check the key properties
-        run: ctest --test-dir build-fuzz --output-on-failure
+  # The parallel-commit protocol against the spec it claims to be. Needs Java and the TLA+
+  # tools, and neither FoundationDB nor SQLite: it checks a specification, not a run.
+  tla:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: cache the TLA+ tools
+        uses: actions/cache@v6
+        with:
+          path: ~/.local/lib/tla2tools.jar
+          key: tla2tools-latest
+
+      - name: Install the TLA+ tools
+        run: |
+          mkdir -p ~/.local/lib
+          [ -f ~/.local/lib/tla2tools.jar ] || curl -fsSL -o ~/.local/lib/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+
+      # Runs TLC twice: once on the derived module and once on the vendored authority, and
+      # fails unless the two report the same state counts.
+      - name: The renaming is the same protocol
+        run: ./ci.sh tla
+
+  spec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: spec
+          build: true
+          test: false
+          lint: false

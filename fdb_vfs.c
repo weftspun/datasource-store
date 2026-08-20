@@ -111,7 +111,25 @@
 
 // The largest number of index rows that fit the transaction that moves the head. This is
 // what bounds a commit overall, because the index must land at once.
+//
+// It used to be `FDB_TXN_LIMIT / PIDX_ROW`, charging KEYMAX for every row. KEYMAX is the
+// size of the *buffer* a key is built in, not the size of a key: `key_pidx` writes
+// "weft/db/<name>/PIDX/" and four big-endian bytes, so a row is 18 + strlen(name) + 8. For
+// a name of ten characters that is 36 bytes against the 648 that were charged, and the
+// ceiling on an atomic commit was 18 times lower than the format requires — 63 MB where
+// 1.1 GB fits. TPC-C found it: a warehouse is about 60 MB of rows and the load failed with
+// SQLITE_IOERR_WRITE, which SQLite reports as "disk I/O error" while naming no limit.
+//
+// The budget is now the real one, computed once per file because the name does not change
+// and the page number is always four bytes. `MAX_TXN_PIDX` stays as the floor a name of the
+// greatest possible length would give, so a caller that wants one number still has one.
 #define MAX_TXN_PIDX (FDB_TXN_LIMIT / PIDX_ROW)
+
+// What else rides in the transaction that moves the head: the SIZE, LOGN and HEAD meta rows,
+// the two keys of a truncate's clear range, and the fence read's conflict range. Each is a
+// key of at most KEYMAX with an eight-byte value, so six of them is a generous reserve, and
+// it is four thousandths of the limit either way.
+#define HEAD_TXN_RESERVE (6 * (KEYMAX + 8))
 
 static FDBDatabase *g_db;
 static pthread_t g_network_thread;
@@ -374,6 +392,11 @@ typedef struct {
 	// The page count at or above which every page is dropped by the pending truncate.
 	// -1 means no truncate is pending.
 	int64_t trunc_pages;
+
+	// What one index row of this file costs the transaction that moves the head: the key
+	// `key_pidx` builds for it, plus the eight-byte value. Fixed for the life of the file,
+	// since the name does not change and a page number is always four bytes.
+	int pidx_row;
 } FdbFile;
 
 // Find the slot of `pgno`, or where it would go. Returns 1 when it is there.
@@ -853,7 +876,7 @@ static DirtyPage *buffer_page(FdbFile *file, uint32_t pgno, int whole, int *rc) 
 
 	if (find_dirty(file, pgno, &slot)) return file->dirty[slot];
 
-	if (file->ndirty >= MAX_TXN_PIDX) {
+	if ((int64_t)(file->ndirty + 1) * file->pidx_row > FDB_TXN_LIMIT - HEAD_TXN_RESERVE) {
 		// The index rows of this commit no longer fit one transaction, so the commit
 		// could not be made atomic.
 		*rc = SQLITE_IOERR_WRITE;
@@ -1939,6 +1962,14 @@ static int vfs_open(sqlite3_vfs *vfs, const char *name, sqlite3_file *file, int 
 	f->base.pMethods = &FDB_IO;
 	f->trunc_pages = -1;
 	snprintf(f->name, MAX_NAME, "%s", name ? name : "anonymous");
+
+	// The real cost of an index row for this name, measured rather than bounded. The page
+	// number is irrelevant to the length — `key_pidx` always writes four bytes for it — so
+	// any page number gives the answer.
+	{
+		uint8_t probe[KEYMAX];
+		f->pidx_row = key_pidx(probe, f->name, 0) + 8;
+	}
 
 	// Decide every staging group before this open raises a fence.
 	//

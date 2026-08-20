@@ -33,6 +33,11 @@ foreach(prog prove_handoff prove_crash prove_big_commit prove_parallel_commit in
   target_link_libraries(${prog} PRIVATE weft_fdb_vfs)
 endforeach()
 
+# TPC-C. Separate from the loop above because it is the only program here that needs threads
+# of its own: a terminal is a thread, and the number of them is the axis the benchmark sweeps.
+add_executable(tpcc tpcc.c)
+target_link_libraries(tpcc PRIVATE weft_fdb_vfs Threads::Threads m)
+
 # The harness, as a subtree. It carries the iceoryx2 C ABI as a dlsym table, the shared
 # limits, and the payload types. Nothing here links iceoryx2: the table dlopens it, so the
 # store builds on a machine that has never seen it and fails at start rather than at link.
