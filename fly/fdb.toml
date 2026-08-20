@@ -30,6 +30,15 @@ primary_region = "sjc"
   WEFT_FDB_PROCS      = "2"
   WEFT_FDB_DATA       = "/data"
 
+  # Peer verification. FoundationDB matches this against the certificate a peer presents, so
+  # it is what makes one wildcard certificate a cluster credential rather than a decoration:
+  # without it, TLS encrypts the link and any certificate at all is accepted at the other end
+  # -- confidentiality without authentication, which is the weaker half of what TLS is for.
+  #
+  # `Check.Valid=1` requires a chain to the CA. `S.CN` pins the subject. Both, because either
+  # alone admits something: a valid certificate for another name, or this name unsigned.
+  WEFT_FDB_TLS_VERIFY = "Check.Valid=1,S.CN=*.chibifire.com"
+
 [mounts]
   source      = "fdb_data"
   destination = "/data"

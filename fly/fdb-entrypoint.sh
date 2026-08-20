@@ -64,11 +64,136 @@ fi
 #
 # Exactly WEFT_FDB_MACHINES coordinators, taken in sorted order, so scaling past three
 # still yields an odd, agreed-upon set rather than everyone who happened to answer.
+# A TLS cluster's coordinator addresses carry a `:tls` suffix, and it is part of the address
+# rather than decoration: a process reading an address without it speaks plaintext to a peer
+# that will not, and the connection fails with no indication that TLS was the reason.
+sfx=""
+[ -n "${FDB_TLS_CERT_B64:-}" ] && sfx=":tls"
 coords=$(printf '%s\n' "$peers" | sort | head -n "$WEFT_FDB_MACHINES" \
-	| sed "s|.*|[&]:$PORT|" | paste -sd, -)
+	| sed "s|.*|[&]:$PORT$sfx|" | paste -sd, -)
 log "coordinators $coords"
 
 mkdir -p /etc/foundationdb "$DATA" /var/log/foundationdb
+
+# Discard the data directory and start empty.
+#
+# This exists because there is no in-place path from a plaintext cluster to a TLS one.
+# A coordinator's address is part of its identity, `:tls` is part of the address, and the
+# coordinated state on disk was written under the old one -- so the processes come up, speak
+# TLS to each other correctly, and never reach a quorum, because the quorum they are looking
+# for is recorded at addresses that no longer exist. `status` reports "Could not communicate
+# with a quorum of coordination servers" and every other signal looks healthy.
+#
+# So enabling TLS on a running cluster means recreating it. That is a real cost and it is
+# written here rather than rediscovered: decide TLS before there is data worth keeping, or
+# plan a backup and restore around the change.
+if [ "${WEFT_FDB_RESET:-0}" = 1 ]; then
+	log "WEFT_FDB_RESET=1: discarding everything under $DATA"
+	rm -rf "${DATA:?}"/* 2>/dev/null || true
+	log "$DATA now holds $(ls -A "$DATA" 2>/dev/null | wc -l) entries"
+fi
+
+# TLS, if the material was given. One wildcard certificate is presented by every process and
+# verified by every peer against the same subject, which is what makes one certificate enough
+# for a whole cluster: FoundationDB pins on the certificate's subject rather than matching a
+# hostname against the address it connected to. On 6PN there is no hostname to match anyway,
+# since peers reach each other at IPv6 literals.
+#
+# The material arrives base64-encoded. A PEM is multi-line, and a multi-line value survives
+# neither a secrets store nor a shell round-trip reliably enough to be trusted with the thing
+# standing between this database and anyone who can route to it.
+tls=0
+if [ -n "${FDB_TLS_CERT_B64:-}" ]; then
+	[ -n "${FDB_TLS_KEY_B64:-}" ] || { echo "FDB_TLS_CERT_B64 without FDB_TLS_KEY_B64" >&2; exit 1; }
+	[ -n "${FDB_TLS_CA_B64:-}" ]  || { echo "FDB_TLS_CERT_B64 without FDB_TLS_CA_B64" >&2; exit 1; }
+	mkdir -p /etc/foundationdb/tls
+	printf '%s' "$FDB_TLS_CERT_B64" | base64 -d > /etc/foundationdb/tls/cert.pem
+	printf '%s' "$FDB_TLS_KEY_B64"  | base64 -d > /etc/foundationdb/tls/key.pem
+	printf '%s' "$FDB_TLS_CA_B64"   | base64 -d > /etc/foundationdb/tls/ca.pem
+	# Complete the chain to a self-signed root, and why this is not optional.
+	#
+	# Let's Encrypt hands out an issuer chain that ends at a *cross-signed* root -- here
+	# `ISRG Root X2` as signed by `ISRG Root X1` -- and not at a self-signed one. OpenSSL's
+	# `verify` accepts that, because `-CAfile` treats every certificate in the file as a
+	# trust anchor, so a check built on it reports OK. FoundationDB does not: it wants a path
+	# to a self-signed root, and without one every handshake fails with
+	# `TLSPolicyFailure Reason="preverification"`.
+	#
+	# The failure mode is the expensive part. The processes start, report healthy, speak TLS
+	# to each other perfectly, and never form a quorum -- `status` says only "Could not
+	# communicate with a quorum of coordination servers", which reads like a networking or
+	# coordinator problem and not like a certificate one.
+	#
+	# Only the roots that actually anchor this chain are appended, rather than the system
+	# bundle. Appending the bundle would work and would quietly widen the trusted issuer set
+	# from one CA to every public CA, leaving `S.CN` as the only thing between this cluster
+	# and anyone who can get a certificate for the name.
+	# Trust anchors only, and the intermediates deliberately left out.
+	#
+	# `tls_ca_file` is the set of certificates FoundationDB will *anchor* a chain at, not the
+	# chain itself: the intermediates travel with the leaf in `tls_certificate_file`, which is
+	# why lego's `.crt` holds four certificates. Putting the intermediates in the CA file as
+	# well makes them anchors, so a chain can terminate at an intermediate that is not
+	# self-signed, and verification fails at `preverification` rather than succeeding by a
+	# shorter path.
+	if [ -f /etc/ssl/certs/ISRG_Root_X1.pem ] || [ -f /etc/ssl/certs/ISRG_Root_X2.pem ]; then
+		: > /etc/foundationdb/tls/ca.pem
+		for root in /etc/ssl/certs/ISRG_Root_X1.pem /etc/ssl/certs/ISRG_Root_X2.pem; do
+			[ -f "$root" ] && cat "$root" >> /etc/foundationdb/tls/ca.pem
+		done
+	fi
+
+	# A self-signed certificate is one whose subject is its own issuer. If none survived the
+	# step above, the chain has no anchor and the handshake will fail on every peer -- so it
+	# fails here instead, where the message can say so.
+	anchors=0
+	csplit -sz -f /tmp/ca- -b '%02d.pem' /etc/foundationdb/tls/ca.pem '/BEGIN CERTIFICATE/' '{*}' 2>/dev/null || true
+	for c in /tmp/ca-*.pem; do
+		[ -f "$c" ] || continue
+		sub=$(openssl x509 -in "$c" -noout -subject 2>/dev/null | sed 's/^subject=//')
+		iss=$(openssl x509 -in "$c" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+		[ -n "$sub" ] && [ "$sub" = "$iss" ] && anchors=$((anchors + 1))
+	done
+	rm -f /tmp/ca-*.pem
+	log "TLS ca.pem: $anchors self-signed anchor(s)"
+	if [ "$anchors" = 0 ]; then
+		echo "the CA file contains no self-signed root" >&2
+		echo "FoundationDB needs a path to a self-signed anchor. `openssl verify -CAfile` will" >&2
+		echo "accept a cross-signed chain and FoundationDB will not, so that check does not" >&2
+		echo "cover this. Every peer handshake would fail with Reason=preverification." >&2
+		exit 1
+	fi
+
+	chmod 0600 /etc/foundationdb/tls/key.pem
+	chmod 0644 /etc/foundationdb/tls/cert.pem /etc/foundationdb/tls/ca.pem
+
+	# The key must match the certificate. They are separate secrets, so nothing else checks
+	# they were rotated together -- and a mismatched pair fails at handshake time, on a peer,
+	# as a connection error rather than as a configuration error. Compared here, where the
+	# message can say what is actually wrong.
+	cpub=$(openssl x509 -in /etc/foundationdb/tls/cert.pem -noout -pubkey 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')
+	kpub=$(openssl pkey -in /etc/foundationdb/tls/key.pem -pubout 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')
+	if [ -z "$cpub" ] || [ "$cpub" != "$kpub" ]; then
+		echo "the TLS key does not match the certificate" >&2
+		echo "  cert public key sha256 ${cpub:-unreadable}" >&2
+		echo "  key  public key sha256 ${kpub:-unreadable}" >&2
+		exit 1
+	fi
+
+	subject=$(openssl x509 -in /etc/foundationdb/tls/cert.pem -noout -subject 2>/dev/null | sed 's/^subject=//')
+	notafter=$(openssl x509 -in /etc/foundationdb/tls/cert.pem -noout -enddate | sed 's/notAfter=//')
+	VERIFY=${WEFT_FDB_TLS_VERIFY:?set WEFT_FDB_TLS_VERIFY when TLS material is given}
+	log "TLS on: subject [$subject] expires $notafter"
+	log "TLS verify_peers: $VERIFY"
+	tls=1
+
+	export FDB_TLS_CERTIFICATE_FILE=/etc/foundationdb/tls/cert.pem
+	export FDB_TLS_KEY_FILE=/etc/foundationdb/tls/key.pem
+	export FDB_TLS_CA_FILE=/etc/foundationdb/tls/ca.pem
+	export FDB_TLS_VERIFY_PEERS="$VERIFY"
+else
+	log "TLS off: no FDB_TLS_CERT_B64. Every byte between these processes is in the clear."
+fi
 echo "${CLUSTER_DESC}:${CLUSTER_ID}@${coords}" > /etc/foundationdb/fdb.cluster
 chmod 0644 /etc/foundationdb/fdb.cluster
 log "cluster file: $(cat /etc/foundationdb/fdb.cluster)"
@@ -93,7 +218,15 @@ conf=/etc/foundationdb/foundationdb.conf
 	echo "command = /usr/sbin/fdbserver"
 	echo "datadir = $DATA/\$ID"
 	echo "logdir = /var/log/foundationdb"
-	echo "public_address = [$self]:\$ID"
+	if [ "$tls" = 1 ]; then
+		echo "public_address = [$self]:\$ID:tls"
+		echo "tls_certificate_file = /etc/foundationdb/tls/cert.pem"
+		echo "tls_key_file = /etc/foundationdb/tls/key.pem"
+		echo "tls_ca_file = /etc/foundationdb/tls/ca.pem"
+		echo "tls_verify_peers = $VERIFY"
+	else
+		echo "public_address = [$self]:\$ID"
+	fi
 	echo "listen_address = public"
 	echo "locality_zoneid = ${FLY_MACHINE_ID:-$self}"
 	echo "locality_machineid = ${FLY_MACHINE_ID:-$self}"
