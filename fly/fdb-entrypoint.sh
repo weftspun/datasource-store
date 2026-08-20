@@ -238,6 +238,57 @@ log "cluster file: $(cat /etc/foundationdb/fdb.cluster)"
 # telling FoundationDB that three machines are one zone would let it place all replicas of a
 # key on one machine and still report itself healthy -- the cluster would claim tolerance it
 # does not have, which is the exact failure `qa/consensus.sh` step 3 exists to catch.
+# Blob store credentials for backup, if the bucket is wired up.
+#
+# The secret is deliberately NOT in the backup URL. `fdbbackup` accepts
+# `blobstore://<key>:<secret>@host/...`, and every use of that form puts the secret in a
+# command line, in shell history, and in `ps` output for every process on the machine. The
+# credentials file exists for this: the URL names `<key>@host` and the secret is resolved at
+# connect time from a file only root can read.
+#
+# The account key is `<access key id>@<host>` and it must match the URL exactly, or the
+# lookup fails and the error names the account rather than the file.
+blob_creds=/etc/foundationdb/blob-credentials.json
+backup=0
+if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -n "${AWS_ENDPOINT_URL_S3:-}" ]; then
+	blob_host=$(printf '%s' "$AWS_ENDPOINT_URL_S3" | sed -e 's|^https\?://||' -e 's|/.*$||')
+	umask 077
+	printf '{"accounts":{"%s@%s":{"secret":"%s"}}}
+' 		"$AWS_ACCESS_KEY_ID" "$blob_host" "$AWS_SECRET_ACCESS_KEY" > "$blob_creds"
+	umask 022
+	chmod 0600 "$blob_creds"
+	export FDB_BLOB_CREDENTIALS=$blob_creds
+	backup=1
+	log "blob store $blob_host bucket ${BUCKET_NAME:-unset}"
+
+	# A second trust bundle, for the backup agent only.
+	#
+	# FoundationDB has no separate TLS policy for blob store connections: the same
+	# `tls_ca_file` and `tls_verify_peers` that authenticate cluster peers are used for the
+	# HTTPS connection to S3. Our `ca.pem` holds one anchor, our own root, and the object
+	# store's certificate comes from a public CA -- so the handshake cannot complete, and it
+	# does not fail cleanly either. It retries until BLOBSTORE_REQUEST_TIMEOUT_MIN and reports
+	# "Could not create backup container: Operation timed out", which reads as a network fault
+	# and is a trust decision.
+	#
+	# So the agent gets our root *and* the public roots. The fdbserver processes do not: they
+	# keep the single anchor, because a cluster that trusts every public CA is a cluster whose
+	# membership is "anyone who can buy a certificate".
+	#
+	# The verification rule is two alternatives, which FoundationDB joins with `|` and treats
+	# as "match any". The first is the cluster rule, unchanged. The second is an exact match
+	# on the endpoint's own name, derived from the endpoint rather than written down, so it
+	# admits one host and not a suffix full of neighbours.
+	ca_blob=/etc/foundationdb/tls/ca-blobstore.pem
+	sys_ca=/etc/ssl/certs/ca-certificates.crt
+	if [ -f "$sys_ca" ] && [ -n "${FDB_TLS_CA_B64:-}" ]; then
+		cat /etc/foundationdb/tls/ca.pem "$sys_ca" > "$ca_blob"
+		log "blob trust bundle: $(grep -c 'BEGIN CERTIFICATE' "$ca_blob") anchors"
+	fi
+else
+	log "no blob store: backup is not configured on this machine"
+fi
+
 conf=/etc/foundationdb/foundationdb.conf
 {
 	echo "[fdbmonitor]"
@@ -271,6 +322,29 @@ conf=/etc/foundationdb/foundationdb.conf
 		echo "[fdbserver.$((PORT + i))]"
 		i=$((i + 1))
 	done
+
+	# The backup agent. It is a *client* of the cluster, not a server, so under mutual TLS it
+	# needs its own certificate, key, CA and verification rule exactly as fdbcli does. An
+	# agent started without them connects to nothing and reports no error worth reading.
+	#
+	# One agent for each machine. Any number of agents pointed at the same database cooperate
+	# on one backup, so this is throughput rather than redundancy, and a machine that is down
+	# takes its agent with it either way.
+	if [ "$backup" = 1 ]; then
+		echo ""
+		echo "[backup_agent]"
+		echo "command = /usr/lib/foundationdb/backup_agent/backup_agent"
+		echo "logdir = /var/log/foundationdb"
+		echo "blob_credentials = $blob_creds"
+		if [ "$tls" = 1 ]; then
+			echo "tls_certificate_file = /etc/foundationdb/tls/cert.pem"
+			echo "tls_key_file = /etc/foundationdb/tls/key.pem"
+			echo "tls_ca_file = $ca_blob"
+			echo "tls_verify_peers = $VERIFY|Check.Valid=1,S.CN=$blob_host"
+		fi
+		echo ""
+		echo "[backup_agent.1]"
+	fi
 } > "$conf"
 log "$PROCS processes from port $PORT"
 
