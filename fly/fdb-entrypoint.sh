@@ -68,7 +68,12 @@ fi
 # rather than decoration: a process reading an address without it speaks plaintext to a peer
 # that will not, and the connection fails with no indication that TLS was the reason.
 sfx=""
-[ -n "${FDB_TLS_CERT_B64:-}" ] && sfx=":tls"
+# Keyed on the CA rather than the certificate, because the certificate is per-machine and is
+# not chosen until further down -- this runs first, so it would always have seen an empty
+# value and written a plaintext coordinator list while each process advertised `:tls`.
+# FoundationDB reports that as "TLS state of public address does not match in coordinator
+# list", which names the symptom and not the ordering.
+[ -n "${FDB_TLS_CA_B64:-}" ] && sfx=":tls"
 coords=$(printf '%s\n' "$peers" | sort | head -n "$WEFT_FDB_MACHINES" \
 	| sed "s|.*|[&]:$PORT$sfx|" | paste -sd, -)
 log "coordinators $coords"
@@ -103,24 +108,33 @@ fi
 # neither a secrets store nor a shell round-trip reliably enough to be trusted with the thing
 # standing between this database and anyone who can route to it.
 tls=0
-# Each machine carries its own certificate, chosen by the last four characters of its NIC.
+# Each machine carries its own certificate, named by its whole Fly machine ID.
 #
-# Not the first four: every Fly NIC begins `de:ad:` -- their OUI -- so a prefix names `dead`
-# on every machine in the fleet and identifies nothing. The last two octets differ.
+# It was the NIC first, and a NIC does not survive `fly machine update`: the same three
+# machines came back as ee13/30cb where they had been 3678/fbc7, so every certificate named
+# hardware that no longer existed and all three refused to start. The machine ID did not move
+# across any of those updates -- it is the identity Fly keeps, and the volume is attached to
+# it -- so it is the thing worth naming.
 #
-# Fly secrets are app-wide rather than per-machine, so all three pairs are present on all
-# three machines and each takes the one addressed to it. A machine that finds no pair for its
-# own NIC stops, because the alternative is falling back to somebody else's identity.
-nic=$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d ':' | tr 'A-Z' 'a-z')
-nic=$(printf '%s' "$nic" | tail -c 4)   # last four, and -c 4 not -c 5: the trailing newline is already gone
-if [ -n "${nic:-}" ] && [ -z "${FDB_TLS_CERT_B64:-}" ]; then
-	eval "FDB_TLS_CERT_B64=\${FDB_TLS_CERT_${nic}_B64:-}"
-	eval "FDB_TLS_KEY_B64=\${FDB_TLS_KEY_${nic}_B64:-}"
+# The whole ID rather than a suffix of it. Four hex characters is 65,536 values, which puts
+# two machines in collision with probability around n^2/131072: nothing at three, about 7% at
+# a hundred, even odds near three hundred. The full ID is unique by construction, so there is
+# no fleet size at which this quietly stops holding and no birthday estimate for a later
+# reader to check. The cost is a longer name, which nothing here reads aloud.
+#
+# Fly secrets are app-wide rather than per-machine, so every pair is present on every machine
+# and each takes the one addressed to it. A machine that finds no pair for itself stops,
+# because the alternative is silently adopting another machine's identity, and peer
+# verification cannot tell the difference.
+mid=$(printf '%s' "${FLY_MACHINE_ID:-}" | tr 'A-Z' 'a-z')
+if [ -n "${mid:-}" ] && [ -z "${FDB_TLS_CERT_B64:-}" ]; then
+	eval "FDB_TLS_CERT_B64=\${FDB_TLS_CERT_${mid}_B64:-}"
+	eval "FDB_TLS_KEY_B64=\${FDB_TLS_KEY_${mid}_B64:-}"
 	if [ -n "${FDB_TLS_CERT_B64:-}" ]; then
-		log "TLS identity fdb-$nic (from NIC), chosen from the per-machine secrets"
+		log "TLS identity fdb-$mid"
 	elif [ -n "${FDB_TLS_CA_B64:-}" ]; then
-		echo "a CA was given but no certificate for this machine's NIC ($nic)" >&2
-		echo "Expected FDB_TLS_CERT_${nic}_B64. Refusing to start rather than borrow another" >&2
+		echo "a CA was given but no certificate for this machine ($mid)" >&2
+		echo "Expected FDB_TLS_CERT_${mid}_B64. Refusing to start rather than borrow another" >&2
 		echo "machine's identity, which would make peer verification meaningless." >&2
 		exit 1
 	fi
