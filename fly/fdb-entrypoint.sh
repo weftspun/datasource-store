@@ -336,6 +336,17 @@ conf=/etc/foundationdb/foundationdb.conf
 		echo "command = /usr/lib/foundationdb/backup_agent/backup_agent"
 		echo "logdir = /var/log/foundationdb"
 		echo "blob_credentials = $blob_creds"
+		# FoundationDB resolves the object store's name, gets an A and a AAAA, and
+		# connects to exactly one of them. pickOneAddress prefers IPv6 whenever a AAAA
+		# exists -- RESOLVE_PREFER_IPV4_ADDR defaults to false -- and there is no
+		# fallback to the other family, so a host without working IPv6 egress never
+		# connects. connect() returns ENETUNREACH and the agent reports connection_failed,
+		# which names the symptom and not the family it chose.
+		#
+		# The cluster itself is unaffected because a cluster file carries literal
+		# addresses. Nothing resolves, so this code path is never reached, which is why
+		# peer traffic stayed healthy while every backup failed.
+		echo "knob_resolve_prefer_ipv4_addr = true"
 		if [ "$tls" = 1 ]; then
 			echo "tls_certificate_file = /etc/foundationdb/tls/cert.pem"
 			echo "tls_key_file = /etc/foundationdb/tls/key.pem"
