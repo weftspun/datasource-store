@@ -460,14 +460,70 @@ struct terminal {
 	long long lat_n[TXN_TYPES], lat_cap[TXN_TYPES];
 };
 
-static sqlite3 *remote_handle(struct terminal *t, int w) {
-	if (w == t->home_w) return t->db;
-	if (!t->remote[w]) {
-		char path[64];
-		warehouse_path(path, sizeof path, w);
-		t->remote[w] = open_db(path, 0);
+// --- one owner for each database ------------------------------------------------------
+//
+// The rule this implements is the store's own: a database has one owner. `open_db` sets
+// `PRAGMA locking_mode=EXCLUSIVE` on that basis, so SQLite may trust its page cache instead
+// of re-reading page 1 for every read transaction -- which over a network database is a
+// round trip each time.
+//
+// The benchmark used to break the rule two different ways, and either one was enough. It
+// opened a handle for each terminal, so terminals sharing a warehouse had two owners; and
+// `remote_handle` opened a second writer to a warehouse another terminal already owned. The
+// symptom at two terminals was `COMMIT -> attempt to write a readonly database`, and at four
+// it was `malloc(): unaligned tcache chunk detected` -- a heap corruption, which is the worse
+// outcome because it has no error to catch.
+//
+// So: one handle for each database, and a lock in front of it. Terminals contend on the lock
+// rather than duplicating the handle. What this measures changes with it, and the change is
+// worth stating rather than discovering later -- concurrency is now bounded by the number of
+// *warehouses*, not the number of terminals. Ten terminals against one warehouse is a queue,
+// as it should be, because they are all writing the same database.
+//
+// Index 0 is the items database, which is read-only and shared. Indexes 1..W are warehouses.
+// Locks are always taken in ascending index order, so no two threads can hold one lock each
+// and wait for the other's. That total order is what makes this deadlock-free, and it is why
+// a transaction must know every database it touches *before* it takes the first lock.
+#define WH_ITEMS 0
+static sqlite3 **WH_DB;
+static pthread_mutex_t *WH_LOCK;
+static int WH_N; // warehouses; the array holds WH_N + 1 entries
+
+// What this thread holds, so it can be released at one place rather than at each of the
+// several `goto` exits every transaction has.
+static __thread int held[24];
+static __thread int held_n;
+
+static int cmp_int(const void *a, const void *b) {
+	int x = *(const int *)a, y = *(const int *)b;
+	return (x > y) - (x < y);
+}
+
+// Lock the given set of databases, ascending, each one once.
+static void wh_lock(const int *want, int n) {
+	int ws[24];
+	if (n > (int)(sizeof ws / sizeof *ws)) n = (int)(sizeof ws / sizeof *ws);
+	memcpy(ws, want, sizeof(int) * (size_t)n);
+	qsort(ws, (size_t)n, sizeof(int), cmp_int);
+	held_n = 0;
+	for (int i = 0; i < n; i++) {
+		if (i && ws[i] == ws[i - 1]) continue; // the same warehouse on two order lines
+		if (ws[i] < 0 || ws[i] > WH_N) continue;
+		pthread_mutex_lock(&WH_LOCK[ws[i]]);
+		held[held_n++] = ws[i];
 	}
-	return t->remote[w];
+}
+
+static void wh_unlock_all(void) {
+	while (held_n > 0) pthread_mutex_unlock(&WH_LOCK[held[--held_n]]);
+}
+
+static sqlite3 *remote_handle(struct terminal *t, int w) {
+	(void)t;
+	// One handle for each warehouse, opened once in `run_once`. This used to open a second
+	// writer here, which is the defect described above.
+	if (w < 1 || w > WH_N) return NULL;
+	return WH_DB[w];
 }
 
 static void record(struct terminal *t, enum txn_type type, double seconds, int ok) {
@@ -510,6 +566,18 @@ static int tx_new_order(struct terminal *t) {
 			all_local = 0;
 		}
 		qty[i] = uniform(&t->rng, 1, 10);
+	}
+
+	// Every database this transaction touches, locked before the first statement. The set
+	// has to be complete here: taking a lock later, after work has begun, is how a deadlock
+	// is built.
+	{
+		int set[17];
+		int n = 0;
+		set[n++] = WH_ITEMS;
+		set[n++] = w;
+		for (int i = 0; i < ol_cnt && n < 17; i++) set[n++] = supply_w[i];
+		wh_lock(set, n);
 	}
 
 	// Which remote warehouses take part decides whether this is one commit or a group.
@@ -621,6 +689,11 @@ static int tx_payment(struct terminal *t) {
 	double amount = uniform(&t->rng, 100, 500000) / 100.0;
 	int by_name = uniform(&t->rng, 1, 100) <= 60;
 
+	{
+		int set[2] = { w, c_w };
+		wh_lock(set, 2);
+	}
+
 	sqlite3 *cdb = remote_handle(t, c_w);
 	if (!cdb) return 0;
 
@@ -715,6 +788,7 @@ give_up:
 // writes measures the commit path and nothing else, and because it is the transaction whose
 // cost the read-ahead window in `spec/ReadAhead.lean` is about.
 static int tx_order_status(struct terminal *t) {
+	{ int set[1] = { t->home_w }; wh_lock(set, 1); }
 	int w = t->home_w;
 	int d = uniform(&t->rng, 1, DISTRICTS_PER_WAREHOUSE);
 	int by_name = uniform(&t->rng, 1, 100) <= 60;
@@ -758,6 +832,7 @@ static int tx_order_status(struct terminal *t) {
 // 2.7. The oldest undelivered order in each of the ten districts, delivered in one go. This
 // is the heaviest write transaction in the mix and the one that moves NEW_ORDER's floor.
 static int tx_delivery(struct terminal *t) {
+	{ int set[1] = { t->home_w }; wh_lock(set, 1); }
 	int w = t->home_w;
 	int carrier = uniform(&t->rng, 1, 10);
 	int delivered = 0;
@@ -816,6 +891,7 @@ undo:
 // Read-only and the only transaction that scans, which is why it is the one that shows what
 // the read-ahead window is worth.
 static int tx_stock_level(struct terminal *t) {
+	{ int set[1] = { t->home_w }; wh_lock(set, 1); }
 	int w = t->home_w;
 	int d = uniform(&t->rng, 1, DISTRICTS_PER_WAREHOUSE);
 	int threshold = uniform(&t->rng, 10, 20);
@@ -893,6 +969,11 @@ static void *terminal_main(void *arg) {
 			case DELIVERY: ok = tx_delivery(t); break;
 			default: ok = tx_stock_level(t); break;
 		}
+		// One place to release, and it must be here rather than inside the transactions:
+		// each of them has several `goto` exits, and an unlock missing from one of those
+		// paths is a hang that appears only under load.
+		wh_unlock_all();
+
 		record(t, type, now() - t0, ok);
 
 		if (t->think) {
@@ -969,6 +1050,23 @@ static double run_once(int warehouses, int terminals, double seconds, int think,
 	pthread_t *th = calloc((size_t)terminals, sizeof *th);
 	if (!ts || !th) return -1;
 
+	// One handle and one lock for each database, before any thread exists.
+	WH_N = warehouses;
+	WH_DB = calloc((size_t)warehouses + 1, sizeof *WH_DB);
+	WH_LOCK = calloc((size_t)warehouses + 1, sizeof *WH_LOCK);
+	if (!WH_DB || !WH_LOCK) return -1;
+	for (int w = 0; w <= warehouses; w++) pthread_mutex_init(&WH_LOCK[w], NULL);
+	WH_DB[WH_ITEMS] = open_db("tpcc-items.db", 1);
+	for (int w = 1; w <= warehouses; w++) {
+		char path[64];
+		warehouse_path(path, sizeof path, w);
+		WH_DB[w] = open_db(path, 0);
+		if (!WH_DB[w]) {
+			fprintf(stderr, "could not open warehouse %d\n", w);
+			return -1;
+		}
+	}
+
 	for (int i = 0; i < terminals; i++) {
 		ts[i].id = i;
 		// Terminals are spread over the warehouses round-robin. With terminals > warehouses
@@ -978,12 +1076,10 @@ static double run_once(int warehouses, int terminals, double seconds, int think,
 		ts[i].warehouses = warehouses;
 		ts[i].rng.s = 0x9e3779b97f4a7c15ULL * (unsigned long long)(i + 1);
 		ts[i].think = think;
-		ts[i].remote = calloc((size_t)warehouses + 1, sizeof(sqlite3 *));
-		char path[64];
-		warehouse_path(path, sizeof path, ts[i].home_w);
-		ts[i].db = open_db(path, 0);
-		ts[i].items = open_db("tpcc-items.db", 1);
-		if (!ts[i].db || !ts[i].items || !ts[i].remote) {
+		ts[i].remote = WH_DB; // shared; kept as a field so the rest of the file is unchanged
+		ts[i].db = WH_DB[ts[i].home_w];
+		ts[i].items = WH_DB[WH_ITEMS];
+		if (!ts[i].db || !ts[i].items) {
 			fprintf(stderr, "terminal %d could not open its databases\n", i);
 			return -1;
 		}
@@ -1012,12 +1108,19 @@ static double run_once(int warehouses, int terminals, double seconds, int think,
 			}
 			free(ts[i].lat[k]);
 		}
-		sqlite3_close(ts[i].db);
-		sqlite3_close(ts[i].items);
-		for (int w = 1; w <= warehouses; w++)
-			if (ts[i].remote[w]) sqlite3_close(ts[i].remote[w]);
-		free(ts[i].remote);
 	}
+
+	// The handles are shared now, so they are closed once here rather than once for each
+	// terminal. Closing them in the loop above would have closed each database as many times
+	// as there were terminals on it.
+	for (int w = 0; w <= warehouses; w++) {
+		if (WH_DB[w]) sqlite3_close(WH_DB[w]);
+		pthread_mutex_destroy(&WH_LOCK[w]);
+	}
+	free(WH_DB);
+	free(WH_LOCK);
+	WH_DB = NULL;
+	WH_LOCK = NULL;
 	free(ts);
 	free(th);
 	return elapsed;
@@ -1036,6 +1139,16 @@ int main(int argc, char **argv) {
 		        "       tpcc sweep <warehouses> <seconds>\n");
 		return 2;
 	}
+
+	// Handles are shared between terminals, so SQLite has to be in its serialized mode. The
+	// program used to spawn threads with no configuration call at all and no mutex anywhere,
+	// which is the other half of the heap corruption: even with one owner for each database,
+	// a library built for single-thread use will corrupt its own allocator.
+	if (!sqlite3_threadsafe()) {
+		fprintf(stderr, "this SQLite was built without thread safety; terminals would corrupt it\n");
+		return 1;
+	}
+	sqlite3_config(SQLITE_CONFIG_SERIALIZED);
 
 	if (weft_fdb_start(getenv("WEFT_FDB_CLUSTER_FILE"))) {
 		fprintf(stderr, "FoundationDB did not start\n");
