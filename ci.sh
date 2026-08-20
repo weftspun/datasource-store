@@ -61,6 +61,19 @@ run_stage() {
 	fi
 }
 
+# The fault fixtures are EXCLUDE_FROM_ALL, so the stages that spawn them ask for them. See
+# the comment in CMakeLists.txt for why they are not in the default build: each one either
+# needs a second process or kills itself, so neither can be an in-process test case, and
+# building them for a developer who only wants the store is work nobody asked for.
+#
+# Built once and reused, because three stages want the same three binaries.
+fixtures_built=0
+need_fixtures() {
+	[ "$fixtures_built" = 1 ] && return 0
+	cmake --build "$BUILD" --target fixtures 		-j"${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}" || return 1
+	fixtures_built=1
+}
+
 # --- the stages -------------------------------------------------------------------------
 
 # What must already be here. Each absence is named, and the count is printed even when it
@@ -100,6 +113,7 @@ stage_surface() {
 # A handoff copies nothing. The reader is a different process with no local file, so this
 # fails if the VFS ever writes one.
 stage_handoff() {
+	need_fixtures || return 1
 	mkdir -p "$RUN"
 	(
 		cd "$RUN"
@@ -132,6 +146,7 @@ stage_big_commit() {
 # below about commit 8 leaves nothing to conserve. A run where no point reached a seeded
 # world asserted nothing and fails.
 stage_parallel_commit() {
+	need_fixtures || return 1
 	mkdir -p "$RUN"
 	cd "$RUN"
 	conserved=0
@@ -154,6 +169,7 @@ stage_parallel_commit() {
 # since the fault lives at a particular point and a single delay rarely lands inside a
 # commit. The full space is the Lean search in `witness/`, too long for a pull request.
 stage_crash() {
+	need_fixtures || return 1
 	mkdir -p "$RUN"
 	cd "$RUN"
 	seeded=0

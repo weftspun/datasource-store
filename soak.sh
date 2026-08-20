@@ -37,6 +37,28 @@ for prog in "$BENCH" "$INTEGRITY" "$CRASH"; do
 	[ -x "$prog" ] || { echo "not executable: $prog" >&2; exit 2; }
 done
 
+# A binary that disappears mid-run is a broken harness, not a finding, and the two must not
+# report the same way. They did: `bench_vfs` is EXCLUDE_FROM_ALL now, and a rebuild that
+# removed it under a running soak produced thousands of rounds marked FAILED in under two
+# minutes, each one indistinguishable in the log from a torn commit.
+#
+# 126 is "found but not executable", 127 is "not found". Neither is a statement about the
+# store, so the run stops and says so rather than accumulating a failure count that means
+# nothing. A soak that keeps scoring after its subject is gone is worse than one that stops,
+# because it produces a number.
+harness_fault() {
+	case "$2" in
+	126|127)
+		echo "" >&2
+		echo "harness fault at round $1: the $3 program exited $2" >&2
+		echo "The programs vanished under the run, so nothing after this round was measured." >&2
+		echo "Rebuild and start again. The rounds before this one stand; the rest were never" >&2
+		echo "tested, and counting them as failures would be counting the harness." >&2
+		exit 3
+		;;
+	esac
+}
+
 start=$(date +%s)
 round=0
 
@@ -64,6 +86,7 @@ note_failure() {
 # the end of the commit sequence. Only the middle one is a fault.
 record_crash_round() {
 	round=$1 elapsed=$2 kind=$3 detail=$4 rc=$5 out=$6
+	harness_fault "$round" "$rc" "$kind"
 
 	case "$rc" in
 	0)
@@ -105,6 +128,7 @@ while :; do
 		out=$("$BENCH" "$ROWS" 2>&1)
 		rc=$?
 		set -e
+		harness_fault "$round" "$rc" load
 		if [ "$rc" -ne 0 ]; then
 			bench_failed=$((bench_failed + 1))
 			printf '%-6s %-8s %-7s %-10s %-4s %s\n' "$round" "$elapsed" load - "$rc" FAILED
@@ -120,6 +144,7 @@ while :; do
 		check=$("$INTEGRITY" bench_fdb.db 2>&1 | tail -1)
 		rc=$?
 		set -e
+		harness_fault "$round" "$rc" integrity
 		if [ "$rc" -ne 0 ] || [ "$check" != "ok" ]; then
 			integrity_failed=$((integrity_failed + 1))
 			printf '%-6s %-8s %-7s %-10s %-4s %s\n' "$round" "$elapsed" load "$reads" "$rc" "$check"
