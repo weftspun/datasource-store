@@ -259,7 +259,31 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	chmod 0600 "$blob_creds"
 	export FDB_BLOB_CREDENTIALS=$blob_creds
 	backup=1
-	log "blob store $blob_host bucket ${BUCKET_NAME:-unset}"
+
+	# The URL is written here rather than left to whoever runs fdbbackup, because two of
+	# its parts are load bearing and neither announces itself when wrong.
+	#
+	# The port is not decoration. Without it FoundationDB substitutes the service *name*
+	# "https" and resolves it through /etc/services, which fails as lookup_failed and
+	# reports itself as a DNS fault. netbase now ships that file, so this is the second
+	# guard rather than the only one.
+	#
+	# The region is explicit because guessRegionFromDomain does not recognise this
+	# endpoint. A guessed region signs the request wrongly and comes back as an auth
+	# error, which reads as bad credentials rather than a bad URL.
+	#
+	# Mode 0600 and beside the credentials: the access key is in the URL, and it is the
+	# same key that file already holds.
+	backup_url=/etc/foundationdb/backup-url
+	umask 077
+	printf 'blobstore://%s@%s:443/%s?bucket=%s&region=%s&sc=1\n' \
+		"$AWS_ACCESS_KEY_ID" "$blob_host" "${WEFT_BACKUP_NAME:-weft}" \
+		"${BUCKET_NAME:-unset}" "${AWS_REGION:-auto}" > "$backup_url"
+	umask 022
+	chmod 0600 "$backup_url"
+
+	log "blob store $blob_host bucket ${BUCKET_NAME:-unset} region ${AWS_REGION:-auto}"
+	log "backup url in $backup_url -- fdbbackup start -d \"\$(cat $backup_url)\" -w"
 
 	# A second trust bundle, for the backup agent only.
 	#
