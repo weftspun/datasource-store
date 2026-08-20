@@ -27,7 +27,7 @@ FUZZ_BUILD=${FUZZ_BUILD:-build-fuzz}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
-ALL='deps build surface handoff integrity big-commit parallel-commit crash fuzz spec'
+ALL='deps build surface handoff integrity big-commit parallel-commit crash fuzz spec tla'
 
 if [ "${1:-}" = "--list" ]; then
 	echo "$ALL" | tr ' ' '\n'
@@ -189,6 +189,63 @@ stage_fuzz() {
 stage_spec() {
 	command -v lake >/dev/null 2>&1 || { echo "missing: lake (elan/Lean toolchain)"; return 1; }
 	(cd spec && lake build)
+}
+
+# The parallel-commit protocol, checked against the spec it claims to be. Three assertions,
+# and the third is the one that means something.
+#
+# One: the committed `WeftParallelCommit.tla` is what `derive.sh` emits from the vendored
+# authority. A renaming that anyone can edit afterwards is not a renaming.
+#
+# Two: TLC checks the derived module — the type invariant, `AckImpliesCommit`, and the four
+# temporal properties the authority states about its own record, intents and timestamp cache.
+#
+# Three: TLC checks the *authority* under the same model, and the two runs must report the
+# same state counts. Identical counts is what "the same protocol" reduces to here: the
+# renaming cannot have added or removed a reachable state. A run of the derived module alone
+# would pass just as happily if the renaming had quietly dropped an action.
+stage_tla() {
+	command -v java >/dev/null 2>&1 || { echo "missing: java"; return 1; }
+	jar=${TLA2TOOLS:-$HOME/.local/lib/tla2tools.jar}
+	[ -f "$jar" ] || { echo "missing: $jar (set TLA2TOOLS)"; return 1; }
+
+	./spec/tla/derive.sh --check || return 1
+
+	work=$RUN/tla
+	rm -rf "$work"; mkdir -p "$work"
+	cp spec/tla/WeftParallelCommit.tla spec/tla/MCWeftParallelCommit.cfg "$work/"
+	cp thirdparty/tla/ParallelCommits.tla "$work/"
+	# The authority's model is this one with the constants named its way, derived here so
+	# the two runs cannot be given different models by accident.
+	sed -e 's/DBS/KEYS/' -e 's/RECOVERERS/PREVENTERS/' \
+		spec/tla/MCWeftParallelCommit.cfg > "$work/MCParallelCommits.cfg"
+
+	tlc() {
+		(cd "$work" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC \
+			-config "MC$1.cfg" -workers "${JOBS:-4}" "$1" 2>&1)
+	}
+
+	authority=$(tlc ParallelCommits)
+	derived=$(tlc WeftParallelCommit)
+
+	for out in "$authority" "$derived"; do
+		case $out in
+			*"Model checking completed. No error has been found."*) ;;
+			*) echo "$out" | tail -30; echo "TLC did not complete cleanly"; return 1 ;;
+		esac
+	done
+
+	# "N states generated, M distinct states found" is the line both runs must agree on.
+	a=$(printf '%s' "$authority" | grep -oE '[0-9]+ states generated, [0-9]+ distinct states found' | tail -1)
+	d=$(printf '%s' "$derived"   | grep -oE '[0-9]+ states generated, [0-9]+ distinct states found' | tail -1)
+	echo "authority: $a"
+	echo "derived:   $d"
+	[ -n "$a" ] || { echo "no state count from the authority's run"; return 1; }
+	if [ "$a" != "$d" ]; then
+		echo "the renaming changed the reachable state space"
+		return 1
+	fi
+	echo "the two state spaces are identical, so the renaming added and removed nothing"
 }
 
 # --- run --------------------------------------------------------------------------------
