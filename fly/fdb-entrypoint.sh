@@ -103,6 +103,29 @@ fi
 # neither a secrets store nor a shell round-trip reliably enough to be trusted with the thing
 # standing between this database and anyone who can route to it.
 tls=0
+# Each machine carries its own certificate, chosen by the last four characters of its NIC.
+#
+# Not the first four: every Fly NIC begins `de:ad:` -- their OUI -- so a prefix names `dead`
+# on every machine in the fleet and identifies nothing. The last two octets differ.
+#
+# Fly secrets are app-wide rather than per-machine, so all three pairs are present on all
+# three machines and each takes the one addressed to it. A machine that finds no pair for its
+# own NIC stops, because the alternative is falling back to somebody else's identity.
+nic=$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d ':' | tr 'A-Z' 'a-z')
+nic=$(printf '%s' "$nic" | tail -c 4)   # last four, and -c 4 not -c 5: the trailing newline is already gone
+if [ -n "${nic:-}" ] && [ -z "${FDB_TLS_CERT_B64:-}" ]; then
+	eval "FDB_TLS_CERT_B64=\${FDB_TLS_CERT_${nic}_B64:-}"
+	eval "FDB_TLS_KEY_B64=\${FDB_TLS_KEY_${nic}_B64:-}"
+	if [ -n "${FDB_TLS_CERT_B64:-}" ]; then
+		log "TLS identity fdb-$nic (from NIC), chosen from the per-machine secrets"
+	elif [ -n "${FDB_TLS_CA_B64:-}" ]; then
+		echo "a CA was given but no certificate for this machine's NIC ($nic)" >&2
+		echo "Expected FDB_TLS_CERT_${nic}_B64. Refusing to start rather than borrow another" >&2
+		echo "machine's identity, which would make peer verification meaningless." >&2
+		exit 1
+	fi
+fi
+
 if [ -n "${FDB_TLS_CERT_B64:-}" ]; then
 	[ -n "${FDB_TLS_KEY_B64:-}" ] || { echo "FDB_TLS_CERT_B64 without FDB_TLS_KEY_B64" >&2; exit 1; }
 	[ -n "${FDB_TLS_CA_B64:-}" ]  || { echo "FDB_TLS_CERT_B64 without FDB_TLS_CA_B64" >&2; exit 1; }
@@ -128,20 +151,17 @@ if [ -n "${FDB_TLS_CERT_B64:-}" ]; then
 	# bundle. Appending the bundle would work and would quietly widen the trusted issuer set
 	# from one CA to every public CA, leaving `S.CN` as the only thing between this cluster
 	# and anyone who can get a certificate for the name.
-	# Trust anchors only, and the intermediates deliberately left out.
+	# The CA file is used exactly as given. Nothing is appended and nothing is truncated.
 	#
-	# `tls_ca_file` is the set of certificates FoundationDB will *anchor* a chain at, not the
-	# chain itself: the intermediates travel with the leaf in `tls_certificate_file`, which is
-	# why lego's `.crt` holds four certificates. Putting the intermediates in the CA file as
-	# well makes them anchors, so a chain can terminate at an intermediate that is not
-	# self-signed, and verification fails at `preverification` rather than succeeding by a
-	# shorter path.
-	if [ -f /etc/ssl/certs/ISRG_Root_X1.pem ] || [ -f /etc/ssl/certs/ISRG_Root_X2.pem ]; then
-		: > /etc/foundationdb/tls/ca.pem
-		for root in /etc/ssl/certs/ISRG_Root_X1.pem /etc/ssl/certs/ISRG_Root_X2.pem; do
-			[ -f "$root" ] && cat "$root" >> /etc/foundationdb/tls/ca.pem
-		done
-	fi
+	# An earlier version completed the chain from the system trust store, written when the
+	# certificate came from a public CA whose chain ends at a cross-signed root. Against a
+	# private CA that would have thrown away the only certificate that matters and trusted the
+	# public roots instead: the cluster would accept anything a public CA had ever issued for
+	# the pinned name, and reject the certificate it was actually given.
+	#
+	# A private root needs none of it. It is self-signed, so it is already an anchor -- which
+	# is the property Let's Encrypt's cross-signed chain could not provide and the reason
+	# every handshake failed at `preverification`.
 
 	# A self-signed certificate is one whose subject is its own issuer. If none survived the
 	# step above, the chain has no anchor and the handshake will fail on every peer -- so it
