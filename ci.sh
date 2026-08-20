@@ -50,6 +50,16 @@ note_result() {
 run_stage() {
 	name=$1
 	printf '\n========== %s\n' "$name"
+	# Back to the source tree before every stage. Two stages `cd` into the run directory
+	# without a subshell, and a stage that moves the shell moves every stage after it: the
+	# first all-stages run resolved `fuzztest`, `spec/tla/derive.sh` and the Lean package
+	# against /tmp, failing three stages that were fine.
+	#
+	# It hid because the workflow splits these across four jobs, so the one arrangement that
+	# reaches it is the arrangement this file exists to provide -- the whole stage list as a
+	# single command. Resetting here covers the two and any stage added later, which naming
+	# the two would not.
+	cd "$here"
 	start=$(date +%s)
 	rc=0
 	"stage_$(echo "$name" | tr - _)" || rc=$?
