@@ -6,7 +6,7 @@
 # but nothing serves a request, because the thread-per-core harness is not written. So
 # this deploys the image and runs no service. See README.md.
 app            = "fabric-store"
-primary_region = "sea"
+primary_region = "sjc"
 
 [build]
   dockerfile = "../Containerfile"

@@ -1,0 +1,47 @@
+# The FoundationDB cluster the store's pages live in.
+#
+#   fly deploy --config fly/fdb.toml --dockerfile fly/Containerfile.fdb
+#
+# Three machines, `double` redundancy, three coordinators. That combination is what
+# `qa/consensus.sh` asserts and it is chosen rather than inherited: `double` keeps two copies
+# of every key, so one machine may be lost, and three coordinators mean a quorum is two, so
+# the same single loss leaves the cluster able to order writes. Two machines with `double`
+# would keep the copies and lose the quorum, which fails as a cluster while looking fine as
+# a replication setting.
+#
+# There are no [[services]] and no public address. FoundationDB is reached by clients on the
+# 6PN private network, and a database on the public internet is a database whose security
+# rests on its own authentication -- which for FDB before TLS is configured is nothing at
+# all.
+app            = "weftspun-fdb"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Containerfile.fdb"
+
+[env]
+  # Required by the entrypoint, and deliberately not defaulted there: the count is how the
+  # entrypoint knows the cluster is whole before writing a coordinator list, so a wrong
+  # default would form a smaller cluster that reports itself healthy. Change this and the
+  # machine count together.
+  WEFT_FDB_MACHINES   = "3"
+  WEFT_FDB_REDUNDANCY = "double"
+  WEFT_FDB_STORAGE    = "ssd-2"
+  WEFT_FDB_PROCS      = "2"
+  WEFT_FDB_DATA       = "/data"
+
+[mounts]
+  source      = "fdb_data"
+  destination = "/data"
+
+# `stop` rather than the default, because a FoundationDB process that is restarted while the
+# cluster is degraded makes the degradation worse. A machine that exits should stay down
+# until someone looks.
+[[restart]]
+  policy = "on-failure"
+  retries = 3
+
+[[vm]]
+  memory   = "2gb"
+  cpu_kind = "shared"
+  cpus     = 2
