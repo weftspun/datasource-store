@@ -274,6 +274,26 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	#
 	# Mode 0600 and beside the credentials: the access key is in the URL, and it is the
 	# same key that file already holds.
+	# knob_resolve_prefer_ipv4_addr is a preference, not a requirement. pickOneAddress
+	# reaches IPv4 only `if (ipV4Addresses.size() > 0)`, so an endpoint that publishes
+	# only AAAA goes back to the path that cannot connect, and says nothing about why.
+	# FoundationDB has no knob that requires IPv4; this is the only lever there is.
+	#
+	# So the precondition the knob depends on is asserted here instead. An endpoint with
+	# no A record is a configuration this cannot back up, and that is worth failing at
+	# start rather than at the first backup, where it arrives as connection_failed and
+	# reads like a network fault.
+	if command -v getent >/dev/null 2>&1; then
+		if getent ahostsv4 "$blob_host" >/dev/null 2>&1; then
+			log "blob store $blob_host publishes an A record"
+		else
+			log "FATAL: $blob_host has no A record, and FoundationDB cannot be made to"
+			log "       require IPv4. It would prefer AAAA, fail to connect, and report"
+			log "       connection_failed. Use an endpoint that publishes IPv4."
+			exit 1
+		fi
+	fi
+
 	backup_url=/etc/foundationdb/backup-url
 	umask 077
 	printf 'blobstore://%s@%s:443/%s?bucket=%s&region=%s&sc=1\n' \
