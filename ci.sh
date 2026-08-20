@@ -23,7 +23,7 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$here"
 
 BUILD=${BUILD:-build}
-FUZZ_BUILD=${FUZZ_BUILD:-build-fuzz}
+FUZZ_BUILD=${FUZZ_BUILD:-build-fuzztest}
 RUN=${RUN:-${TMPDIR:-/tmp}/weft-ci-run}
 export WEFT_FDB_CLUSTER_FILE=${WEFT_FDB_CLUSTER_FILE:-/etc/foundationdb/fdb.cluster}
 
@@ -179,7 +179,7 @@ stage_crash() {
 # over hours is a separate run.
 stage_fuzz() {
 	CC=${CC:-clang} CXX=${CXX:-clang++} \
-		cmake -S fuzz -B "$FUZZ_BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+		cmake -S fuzztest -B "$FUZZ_BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo
 	cmake --build "$FUZZ_BUILD" -j"${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 	ctest --test-dir "$FUZZ_BUILD" --output-on-failure
 }

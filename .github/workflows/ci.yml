@@ -73,8 +73,8 @@ jobs:
       - name: cache the FuzzTest build
         uses: actions/cache@v6
         with:
-          path: build-fuzz/_deps
-          key: fuzztest-${{ hashFiles('fuzz/CMakeLists.txt') }}
+          path: build-fuzztest/_deps
+          key: fuzztest-${{ hashFiles('fuzztest/CMakeLists.txt') }}
 
       - name: The key properties
         env:
