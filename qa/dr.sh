@@ -62,6 +62,19 @@ bring_up() {
 	wait_for "available" 180 cluster_answers
 }
 
+# Every binary is resolved before anything starts, because the alternative is not a
+# failure. `backup_agent` is installed to /usr/lib/foundationdb/backup_agent/ and is not on
+# PATH, so the default resolved to nothing, the agent never ran, and `fdbbackup start -w`
+# blocked forever waiting for a job nobody would pick up. The run sat silent until the
+# unit's TimeoutStartSec killed it -- ten minutes that read as slow rather than broken.
+#
+# A missing binary is a FAIL here, named, before a cluster exists to clean up.
+for tool in SERVER CLI BACKUP RESTORE AGENT; do
+	eval "path=\$$tool"
+	command -v "$path" >/dev/null 2>&1 || [ -x "$path" ] ||
+		fail "$tool: '$path' is not executable and not on PATH"
+done
+
 rm -rf "$ROOT"
 mkdir -p "$ROOT/logs" "$ROOT/backup" "$ROOT/d1" "$ROOT/d2" "$ROOT/d3"
 printf 'weftdr:weftdr@127.0.0.1:4711,127.0.0.1:4712,127.0.0.1:4713' >"$CF"

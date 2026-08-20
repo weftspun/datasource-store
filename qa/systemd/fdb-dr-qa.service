@@ -13,6 +13,11 @@ Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=600
 WorkingDirectory=@QADIR@
+# The FoundationDB packages install backup_agent outside PATH, and a systemd unit does not
+# inherit the interactive shell's PATH either. Naming it here rather than relying on the
+# script's default is what keeps the two callers -- this unit and a developer's shell --
+# resolving the same binary.
+Environment=AGENT=/usr/lib/foundationdb/backup_agent/backup_agent
 ExecStart=/bin/bash @QADIR@/dr.sh
 ExecStopPost=/bin/sh -c 'echo "[dr] unit finished with status $EXIT_STATUS"'
 
