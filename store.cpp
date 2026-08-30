@@ -98,9 +98,27 @@ sqlite3* open_avatar(std::uint64_t avatar) {
     return db;
 }
 
-// Run one statement and put the rows in the reply, tab separated and one row to a line.
-// Truncating is not silent: the caller sees the length it got and the code says OK, so a
-// reader that cares compares the two.
+// One CBOR head: major type and its length or value, big-endian per RFC 8949.
+void cbor_head(std::string& out, std::uint8_t major, std::uint64_t v) {
+    const std::uint8_t m = static_cast<std::uint8_t>(major << 5);
+    if (v < 24) {
+        out.push_back(static_cast<char>(m | v));
+    } else if (v <= 0xff) {
+        out.push_back(static_cast<char>(m | 24));
+        out.push_back(static_cast<char>(v));
+    } else if (v <= 0xffff) {
+        out.push_back(static_cast<char>(m | 25));
+        out.push_back(static_cast<char>(v >> 8));
+        out.push_back(static_cast<char>(v));
+    } else {
+        out.push_back(static_cast<char>(m | 26));
+        for (int s = 24; s >= 0; s -= 8) out.push_back(static_cast<char>(v >> s));
+    }
+}
+
+// Run one statement and put the rows in the reply as CBOR: an indefinite-length array of
+// rows, each row a definite array of text strings, NULL as null. Truncation drops whole
+// rows so the document stays well formed; the caller sees fewer rows, never a torn one.
 int read_rows(sqlite3* db, const char* sql, std::uint8_t* body, std::uint32_t* length) {
     sqlite3_stmt* st = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
@@ -108,22 +126,29 @@ int read_rows(sqlite3* db, const char* sql, std::uint8_t* body, std::uint32_t* l
     }
 
     std::string out;
+    out.push_back(static_cast<char>(0x9f));
     while (sqlite3_step(st) == SQLITE_ROW) {
         const int columns = sqlite3_column_count(st);
+        std::string row;
+        cbor_head(row, 4, static_cast<std::uint64_t>(columns));
         for (int i = 0; i < columns; ++i) {
-            if (i) out.push_back('\t');
             const unsigned char* text = sqlite3_column_text(st, i);
-            out.append(text ? reinterpret_cast<const char*>(text) : "");
+            if (!text) {
+                row.push_back(static_cast<char>(0xf6));
+                continue;
+            }
+            const std::size_t n = static_cast<std::size_t>(sqlite3_column_bytes(st, i));
+            cbor_head(row, 3, n);
+            row.append(reinterpret_cast<const char*>(text), n);
         }
-        out.push_back('\n');
-        if (out.size() >= weft::STORE_BODY_BYTES) break;
+        if (out.size() + row.size() + 1 > weft::STORE_BODY_BYTES) break;
+        out += row;
     }
+    out.push_back(static_cast<char>(0xff));
     sqlite3_finalize(st);
 
-    const std::size_t n = out.size() < weft::STORE_BODY_BYTES ? out.size()
-                                                              : weft::STORE_BODY_BYTES;
-    std::memcpy(body, out.data(), n);
-    *length = static_cast<std::uint32_t>(n);
+    std::memcpy(body, out.data(), out.size());
+    *length = static_cast<std::uint32_t>(out.size());
     return SQLITE_OK;
 }
 
