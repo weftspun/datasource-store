@@ -335,9 +335,7 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	# fdb.toml reads over busybox httpd. A stale backup then fails a check in
 	# `fly status` instead of being discovered at restore time. The loop
 	# refuses to arm unless its own controls fire (see backup-fresh.sh).
-	mkdir -p /run/backup-fresh
 	/usr/local/bin/backup-fresh.sh >> /var/log/foundationdb/backup-fresh.log 2>&1 &
-	busybox httpd -p 8081 -h /run/backup-fresh
 	log "backup freshness check on :8081/health, max age ${WEFT_BACKUP_MAX_AGE:-3600}s"
 
 	# There used to be a second trust bundle here, cluster root plus public roots,
@@ -417,6 +415,18 @@ log "$PROCS processes from port $PORT"
 /usr/lib/foundationdb/fdbmonitor --conffile "$conf" --lockfile /var/run/fdbmonitor.pid &
 monitor=$!
 log "fdbmonitor pid $monitor"
+
+# The roll gate, in the Kubernetes FDB operator's manner: Fly advances a
+# rolling deploy only when every machine check passes, and this one fails
+# until the data state is healthy and a zone can be lost without losing
+# data. A restart therefore waits out its predecessor's re-replication
+# instead of stalling shards whose replicas span both machines.
+# One httpd serves both health files: /health (backup freshness, when the
+# blob store is wired) and /cluster (the roll gate, always).
+mkdir -p /run/backup-fresh
+busybox httpd -p 8081 -h /run/backup-fresh
+/usr/local/bin/cluster-health.sh >> /var/log/foundationdb/cluster-health.log 2>&1 &
+log "cluster health gate on :8081/cluster"
 
 # Whoever holds the lowest address configures the database, once. A deterministic choice
 # rather than a lock, because `configure new` is idempotent in the way that matters: it

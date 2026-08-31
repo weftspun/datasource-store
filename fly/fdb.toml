@@ -71,6 +71,18 @@ primary_region = "sjc"
     timeout = "10s"
     grace_period = "10m"
 
+  # The roll gate: fails until the data state is healthy and a zone can be
+  # lost without losing data, so a rolling deploy waits out re-replication
+  # after each machine restart -- the Kubernetes FDB operator's behaviour,
+  # expressed as a machine check.
+  [checks.cluster_health]
+    type = "http"
+    port = 8081
+    path = "/cluster"
+    interval = "30s"
+    timeout = "10s"
+    grace_period = "5m"
+
 # `stop` rather than the default, because a FoundationDB process that is restarted while the
 # cluster is degraded makes the degradation worse. A machine that exits should stay down
 # until someone looks.

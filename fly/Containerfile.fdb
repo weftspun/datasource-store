@@ -36,5 +36,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY fly/fdb-entrypoint.sh /usr/local/bin/fdb-entrypoint.sh
 COPY fly/backup-fresh.sh /usr/local/bin/backup-fresh.sh
-RUN chmod +x /usr/local/bin/fdb-entrypoint.sh /usr/local/bin/backup-fresh.sh
+COPY fly/cluster-health.sh /usr/local/bin/cluster-health.sh
+RUN chmod +x /usr/local/bin/fdb-entrypoint.sh /usr/local/bin/backup-fresh.sh /usr/local/bin/cluster-health.sh
 ENTRYPOINT ["/usr/local/bin/fdb-entrypoint.sh"]
