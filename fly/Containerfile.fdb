@@ -21,7 +21,7 @@ ARG FDB_VERSION
 # reads "DNS lookup failed" -- so a missing 30 kB file is reported as a DNS fault, for
 # every hostname, while getent and curl both work because neither reads /etc/services.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates dnsutils procps openssl netbase \
+      curl ca-certificates dnsutils procps openssl netbase stunnel4 \
   && curl -fsSL -o /tmp/clients.deb \
       "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb" \
   && curl -fsSL -o /tmp/server.deb \
