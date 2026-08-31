@@ -254,20 +254,28 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	blob_host=$(printf '%s' "$AWS_ENDPOINT_URL_S3" | sed -e 's|^https\?://||' -e 's|/.*$||')
 	umask 077
 	printf '{"accounts":{"%s@%s":{"secret":"%s"}}}
-' 		"$AWS_ACCESS_KEY_ID" "127.0.0.1" "$AWS_SECRET_ACCESS_KEY" > "$blob_creds"
+' 		"$AWS_ACCESS_KEY_ID" "$blob_host" "$AWS_SECRET_ACCESS_KEY" > "$blob_creds"
 	umask 022
 	chmod 0600 "$blob_creds"
 	export FDB_BLOB_CREDENTIALS=$blob_creds
 	backup=1
 
-	# The account above is keyed to 127.0.0.1 because that is the host in the backup
-	# URL: FoundationDB never dials the blob store itself. Its TLS client sends no
+	# FoundationDB never dials the blob store directly. Its TLS client sends no
 	# SNI, and Tigris's edge closes any handshake without one -- measured as
 	# N2_ConnectHandshakeError "stream truncated" on the A and the AAAA record
-	# alike, while openssl with -servername succeeds from the same machine. So an
-	# stunnel client on loopback adds the SNI: FoundationDB speaks plaintext to
-	# 127.0.0.1:8443 inside the machine, and stunnel opens the TLS to the endpoint,
-	# verifies its chain against the system roots, and pins the name.
+	# alike, while openssl with -servername succeeds from the same machine. An
+	# stunnel client on loopback adds the SNI and verifies the public chain.
+	#
+	# The endpoint's NAME must survive the hop: Tigris routes the bucket from the
+	# Host header, and a request arriving as Host: 127.0.0.1 was answered with
+	# <BucketName>127.0.0.1</BucketName>, the path read as a key. So the IP is
+	# resolved first, stunnel dials the literal, and /etc/hosts then points the
+	# name at loopback -- FoundationDB keeps signing and sending the real
+	# hostname while its bytes go one syscall away. The IP is pinned until the
+	# next machine start; a rotation surfaces as checkHost refusing the new
+	# certificate, not as silent data to a stranger.
+	blob_ip=$(getent ahostsv4 "$blob_host" | head -1 | cut -d' ' -f1)
+	[ -n "$blob_ip" ] || { echo "cannot resolve $blob_host" >&2; exit 1; }
 	cat > /etc/foundationdb/stunnel-blob.conf <<-EOF
 		foreground = no
 		output = /var/log/foundationdb/stunnel-blob.log
@@ -275,14 +283,15 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 		[blob]
 		client = yes
 		accept = 127.0.0.1:8443
-		connect = ${blob_host}:443
+		connect = ${blob_ip}:443
 		sni = ${blob_host}
 		CAfile = /etc/ssl/certs/ca-certificates.crt
 		verifyChain = yes
 		checkHost = ${blob_host}
 	EOF
 	stunnel4 /etc/foundationdb/stunnel-blob.conf
-	log "stunnel on 127.0.0.1:8443 adds the SNI FoundationDB does not send"
+	echo "127.0.0.1 $blob_host" >> /etc/hosts
+	log "stunnel 127.0.0.1:8443 -> $blob_ip:443 adds the SNI FoundationDB does not send"
 
 	# The URL is written here rather than left to whoever runs fdbbackup, because two of
 	# its parts are load bearing and neither announces itself when wrong.
@@ -309,13 +318,13 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	# the printed command is not optional either -- FoundationDB signs SigV2 by
 	# default and Tigris (like versitygw, where this was measured) refuses
 	# anything but SigV4.
-	printf 'blobstore://%s@127.0.0.1:8443/%s?bucket=%s&region=%s&sc=0\n' \
-		"$AWS_ACCESS_KEY_ID" "${WEFT_BACKUP_NAME:-weft}" \
+	printf 'blobstore://%s@%s:8443/%s?bucket=%s&region=%s&sc=0\n' \
+		"$AWS_ACCESS_KEY_ID" "$blob_host" "${WEFT_BACKUP_NAME:-weft}" \
 		"${BUCKET_NAME:-unset}" "${AWS_REGION:-auto}" > "$backup_url"
 	umask 022
 	chmod 0600 "$backup_url"
 
-	log "blob store $blob_host via 127.0.0.1:8443, bucket ${BUCKET_NAME:-unset} region ${AWS_REGION:-auto}"
+	log "blob store $blob_host via loopback 8443, bucket ${BUCKET_NAME:-unset} region ${AWS_REGION:-auto}"
 	log "backup url in $backup_url -- fdbbackup start -d \"\$(cat $backup_url)\" -w \\"
 	log "  --blob-credentials $blob_creds --knob_http_request_aws_v4_header=true"
 
@@ -376,7 +385,7 @@ conf=/etc/foundationdb/foundationdb.conf
 		echo "command = /usr/lib/foundationdb/backup_agent/backup_agent"
 		echo "logdir = /var/log/foundationdb"
 		echo "blob_credentials = $blob_creds"
-		# The blob store is 127.0.0.1 now, so the resolver preferences and the blob
+		# The blob store rides the loopback hop now, so the resolver preferences and the blob
 		# trust additions this section used to carry are gone with the direct dial.
 		# SigV4, because the endpoint behind the stunnel hop refuses SigV2, and
 		# FoundationDB signs SigV2 unless told otherwise.
