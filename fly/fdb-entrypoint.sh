@@ -254,11 +254,35 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	blob_host=$(printf '%s' "$AWS_ENDPOINT_URL_S3" | sed -e 's|^https\?://||' -e 's|/.*$||')
 	umask 077
 	printf '{"accounts":{"%s@%s":{"secret":"%s"}}}
-' 		"$AWS_ACCESS_KEY_ID" "$blob_host" "$AWS_SECRET_ACCESS_KEY" > "$blob_creds"
+' 		"$AWS_ACCESS_KEY_ID" "127.0.0.1" "$AWS_SECRET_ACCESS_KEY" > "$blob_creds"
 	umask 022
 	chmod 0600 "$blob_creds"
 	export FDB_BLOB_CREDENTIALS=$blob_creds
 	backup=1
+
+	# The account above is keyed to 127.0.0.1 because that is the host in the backup
+	# URL: FoundationDB never dials the blob store itself. Its TLS client sends no
+	# SNI, and Tigris's edge closes any handshake without one -- measured as
+	# N2_ConnectHandshakeError "stream truncated" on the A and the AAAA record
+	# alike, while openssl with -servername succeeds from the same machine. So an
+	# stunnel client on loopback adds the SNI: FoundationDB speaks plaintext to
+	# 127.0.0.1:8443 inside the machine, and stunnel opens the TLS to the endpoint,
+	# verifies its chain against the system roots, and pins the name.
+	cat > /etc/foundationdb/stunnel-blob.conf <<-EOF
+		foreground = no
+		output = /var/log/foundationdb/stunnel-blob.log
+		pid = /var/run/stunnel-blob.pid
+		[blob]
+		client = yes
+		accept = 127.0.0.1:8443
+		connect = ${blob_host}:443
+		sni = ${blob_host}
+		CAfile = /etc/ssl/certs/ca-certificates.crt
+		verifyChain = yes
+		checkHost = ${blob_host}
+	EOF
+	stunnel4 /etc/foundationdb/stunnel-blob.conf
+	log "stunnel on 127.0.0.1:8443 adds the SNI FoundationDB does not send"
 
 	# The URL is written here rather than left to whoever runs fdbbackup, because two of
 	# its parts are load bearing and neither announces itself when wrong.
@@ -274,61 +298,33 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	#
 	# Mode 0600 and beside the credentials: the access key is in the URL, and it is the
 	# same key that file already holds.
-	# knob_resolve_prefer_ipv4_addr is a preference, not a requirement. pickOneAddress
-	# reaches IPv4 only `if (ipV4Addresses.size() > 0)`, so an endpoint that publishes
-	# only AAAA goes back to the path that cannot connect, and says nothing about why.
-	# FoundationDB has no knob that requires IPv4; this is the only lever there is.
-	#
-	# So the precondition the knob depends on is asserted here instead. An endpoint with
-	# no A record is a configuration this cannot back up, and that is worth failing at
-	# start rather than at the first backup, where it arrives as connection_failed and
-	# reads like a network fault.
-	if command -v getent >/dev/null 2>&1; then
-		if getent ahostsv4 "$blob_host" >/dev/null 2>&1; then
-			log "blob store $blob_host publishes an A record"
-		else
-			log "FATAL: $blob_host has no A record, and FoundationDB cannot be made to"
-			log "       require IPv4. It would prefer AAAA, fail to connect, and report"
-			log "       connection_failed. Use an endpoint that publishes IPv4."
-			exit 1
-		fi
-	fi
+	# There used to be a fatal A-record assertion here, because FoundationDB's
+	# pickOneAddress prefers IPv6 with no fallback and no knob to require IPv4.
+	# stunnel dials the endpoint now and falls back across families like any
+	# ordinary client, so the address family stopped being a precondition.
 
 	backup_url=/etc/foundationdb/backup-url
 	umask 077
-	printf 'blobstore://%s@%s:443/%s?bucket=%s&region=%s&sc=1\n' \
-		"$AWS_ACCESS_KEY_ID" "$blob_host" "${WEFT_BACKUP_NAME:-weft}" \
+	# sc=0 on loopback: the TLS starts at stunnel, one syscall away. The v4 knob in
+	# the printed command is not optional either -- FoundationDB signs SigV2 by
+	# default and Tigris (like versitygw, where this was measured) refuses
+	# anything but SigV4.
+	printf 'blobstore://%s@127.0.0.1:8443/%s?bucket=%s&region=%s&sc=0\n' \
+		"$AWS_ACCESS_KEY_ID" "${WEFT_BACKUP_NAME:-weft}" \
 		"${BUCKET_NAME:-unset}" "${AWS_REGION:-auto}" > "$backup_url"
 	umask 022
 	chmod 0600 "$backup_url"
 
-	log "blob store $blob_host bucket ${BUCKET_NAME:-unset} region ${AWS_REGION:-auto}"
-	log "backup url in $backup_url -- fdbbackup start -d \"\$(cat $backup_url)\" -w"
+	log "blob store $blob_host via 127.0.0.1:8443, bucket ${BUCKET_NAME:-unset} region ${AWS_REGION:-auto}"
+	log "backup url in $backup_url -- fdbbackup start -d \"\$(cat $backup_url)\" -w \\"
+	log "  --blob-credentials $blob_creds --knob_http_request_aws_v4_header=true"
 
-	# A second trust bundle, for the backup agent only.
-	#
-	# FoundationDB has no separate TLS policy for blob store connections: the same
-	# `tls_ca_file` and `tls_verify_peers` that authenticate cluster peers are used for the
-	# HTTPS connection to S3. Our `ca.pem` holds one anchor, our own root, and the object
-	# store's certificate comes from a public CA -- so the handshake cannot complete, and it
-	# does not fail cleanly either. It retries until BLOBSTORE_REQUEST_TIMEOUT_MIN and reports
-	# "Could not create backup container: Operation timed out", which reads as a network fault
-	# and is a trust decision.
-	#
-	# So the agent gets our root *and* the public roots. The fdbserver processes do not: they
-	# keep the single anchor, because a cluster that trusts every public CA is a cluster whose
-	# membership is "anyone who can buy a certificate".
-	#
-	# The verification rule is two alternatives, which FoundationDB joins with `|` and treats
-	# as "match any". The first is the cluster rule, unchanged. The second is an exact match
-	# on the endpoint's own name, derived from the endpoint rather than written down, so it
-	# admits one host and not a suffix full of neighbours.
-	ca_blob=/etc/foundationdb/tls/ca-blobstore.pem
-	sys_ca=/etc/ssl/certs/ca-certificates.crt
-	if [ -f "$sys_ca" ] && [ -n "${FDB_TLS_CA_B64:-}" ]; then
-		cat /etc/foundationdb/tls/ca.pem "$sys_ca" > "$ca_blob"
-		log "blob trust bundle: $(grep -c 'BEGIN CERTIFICATE' "$ca_blob") anchors"
-	fi
+	# There used to be a second trust bundle here, cluster root plus public roots,
+	# because the agent's one TLS policy covered both peers and the blob store.
+	# The stunnel hop retires it: the agent's blob traffic is loopback plaintext,
+	# the public-root verification happens in stunnel, and the agent's TLS policy
+	# goes back to covering exactly the cluster. A trust store that admits every
+	# public CA never touches a FoundationDB process again.
 else
 	log "no blob store: backup is not configured on this machine"
 fi
@@ -380,22 +376,16 @@ conf=/etc/foundationdb/foundationdb.conf
 		echo "command = /usr/lib/foundationdb/backup_agent/backup_agent"
 		echo "logdir = /var/log/foundationdb"
 		echo "blob_credentials = $blob_creds"
-		# FoundationDB resolves the object store's name, gets an A and a AAAA, and
-		# connects to exactly one of them. pickOneAddress prefers IPv6 whenever a AAAA
-		# exists -- RESOLVE_PREFER_IPV4_ADDR defaults to false -- and there is no
-		# fallback to the other family, so a host without working IPv6 egress never
-		# connects. connect() returns ENETUNREACH and the agent reports connection_failed,
-		# which names the symptom and not the family it chose.
-		#
-		# The cluster itself is unaffected because a cluster file carries literal
-		# addresses. Nothing resolves, so this code path is never reached, which is why
-		# peer traffic stayed healthy while every backup failed.
-		echo "knob_resolve_prefer_ipv4_addr = true"
+		# The blob store is 127.0.0.1 now, so the resolver preferences and the blob
+		# trust additions this section used to carry are gone with the direct dial.
+		# SigV4, because the endpoint behind the stunnel hop refuses SigV2, and
+		# FoundationDB signs SigV2 unless told otherwise.
+		echo "knob_http_request_aws_v4_header = true"
 		if [ "$tls" = 1 ]; then
 			echo "tls_certificate_file = /etc/foundationdb/tls/cert.pem"
 			echo "tls_key_file = /etc/foundationdb/tls/key.pem"
-			echo "tls_ca_file = $ca_blob"
-			echo "tls_verify_peers = $VERIFY|Check.Valid=1,S.CN=$blob_host"
+			echo "tls_ca_file = /etc/foundationdb/tls/ca.pem"
+			echo "tls_verify_peers = $VERIFY"
 		fi
 		echo ""
 		echo "[backup_agent.1]"
