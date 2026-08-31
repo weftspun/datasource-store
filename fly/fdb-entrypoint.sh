@@ -325,7 +325,7 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	chmod 0600 "$backup_url"
 
 	log "blob store $blob_host via loopback 8443, bucket ${BUCKET_NAME:-unset} region ${AWS_REGION:-auto}"
-	log "backup url in $backup_url -- fdbbackup start -d \"\$(cat $backup_url)\" -w \\"
+	log "backup url in $backup_url -- fdbbackup start -z -d \"\$(cat $backup_url)\" \\"
 	log "  --blob-credentials $blob_creds --knob_http_request_aws_v4_header=true"
 
 	# Freshness, asserted from the machine that already holds the credentials.
