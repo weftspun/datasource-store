@@ -56,6 +56,21 @@ primary_region = "sjc"
   source      = "fdb_data"
   destination = "/data"
 
+# The backup freshness check, read from the health file backup-fresh.sh
+# maintains: fresh means the newest data/ object in the bucket is younger than
+# WEFT_BACKUP_MAX_AGE. It lives here because this machine already holds the
+# bucket credentials -- CI has no production access, and the spend keeper's
+# authority does not grow a monitoring pattern. A stale backup fails a check
+# in `fly status` instead of surfacing at restore time.
+[checks]
+  [checks.backup_fresh]
+    type = "http"
+    port = 8081
+    path = "/health"
+    interval = "2m"
+    timeout = "10s"
+    grace_period = "10m"
+
 # `stop` rather than the default, because a FoundationDB process that is restarted while the
 # cluster is degraded makes the degradation worse. A machine that exits should stay down
 # until someone looks.

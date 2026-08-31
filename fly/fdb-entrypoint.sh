@@ -328,6 +328,18 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	log "backup url in $backup_url -- fdbbackup start -d \"\$(cat $backup_url)\" -w \\"
 	log "  --blob-credentials $blob_creds --knob_http_request_aws_v4_header=true"
 
+	# Freshness, asserted from the machine that already holds the credentials.
+	# `fdbbackup status` is the process's opinion of itself; the loop measures
+	# the bucket -- the age of the newest data/ object, what a restore would
+	# find -- and publishes a health file that the Fly machine check in
+	# fdb.toml reads over busybox httpd. A stale backup then fails a check in
+	# `fly status` instead of being discovered at restore time. The loop
+	# refuses to arm unless its own controls fire (see backup-fresh.sh).
+	mkdir -p /run/backup-fresh
+	/usr/local/bin/backup-fresh.sh >> /var/log/foundationdb/backup-fresh.log 2>&1 &
+	busybox httpd -p 8081 -h /run/backup-fresh
+	log "backup freshness check on :8081/health, max age ${WEFT_BACKUP_MAX_AGE:-3600}s"
+
 	# There used to be a second trust bundle here, cluster root plus public roots,
 	# because the agent's one TLS policy covered both peers and the blob store.
 	# The stunnel hop retires it: the agent's blob traffic is loopback plaintext,
