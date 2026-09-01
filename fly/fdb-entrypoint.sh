@@ -338,6 +338,12 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	/usr/local/bin/backup-fresh.sh >> /var/log/foundationdb/backup-fresh.log 2>&1 &
 	log "backup freshness check on :8081/health, max age ${WEFT_BACKUP_MAX_AGE:-3600}s"
 
+	if [ -n "${R2_ACCESS_KEY_ID:-}" ]; then
+		/usr/local/bin/backup-fresh.sh --tag dr \
+			>> /var/log/foundationdb/backup-fresh-dr.log 2>&1 &
+		log "DR backup freshness check on :8081/dr, tag dr"
+	fi
+
 	# There used to be a second trust bundle here, cluster root plus public roots,
 	# because the agent's one TLS policy covered both peers and the blob store.
 	# The stunnel hop retires it: the agent's blob traffic is loopback plaintext,
@@ -346,6 +352,54 @@ if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && [ -
 	# public CA never touches a FoundationDB process again.
 else
 	log "no blob store: backup is not configured on this machine"
+fi
+
+# The DR destination. R2 Infrequent Access, reached through a second stunnel
+# hop for the same SNI reason. Guarded by its own env: a machine without the
+# R2 credentials publishes /cluster-dr = critical rather than passing on
+# nothing, and the negative control fires on the machine check.
+blob_creds_r2=/etc/foundationdb/blob-credentials-r2.json
+backup_r2=0
+if [ -n "${R2_ACCESS_KEY_ID:-}" ] && [ -n "${R2_SECRET_ACCESS_KEY:-}" ] && [ -n "${R2_ENDPOINT_URL:-}" ]; then
+	blob_host_r2=$(printf '%s' "$R2_ENDPOINT_URL" | sed -e 's|^https\?://||' -e 's|/.*$||')
+	umask 077
+	printf '{"accounts":{"%s@%s":{"secret":"%s"}}}\n' \
+		"$R2_ACCESS_KEY_ID" "$blob_host_r2" "$R2_SECRET_ACCESS_KEY" > "$blob_creds_r2"
+	umask 022
+	chmod 0600 "$blob_creds_r2"
+	export FDB_BLOB_CREDENTIALS="$blob_creds:$blob_creds_r2"
+	backup_r2=1
+
+	blob_ip_r2=$(getent ahostsv4 "$blob_host_r2" | head -1 | cut -d' ' -f1)
+	[ -n "$blob_ip_r2" ] || { echo "cannot resolve $blob_host_r2" >&2; exit 1; }
+	cat > /etc/foundationdb/stunnel-blob-r2.conf <<-EOF
+		foreground = no
+		output = /var/log/foundationdb/stunnel-blob-r2.log
+		pid = /var/run/stunnel-blob-r2.pid
+		[blob-r2]
+		client = yes
+		accept = 127.0.0.1:8444
+		connect = ${blob_ip_r2}:443
+		sni = ${blob_host_r2}
+		CAfile = /etc/ssl/certs/ca-certificates.crt
+		verifyChain = yes
+		checkHost = ${blob_host_r2}
+	EOF
+	stunnel4 /etc/foundationdb/stunnel-blob-r2.conf
+	echo "127.0.0.1 $blob_host_r2" >> /etc/hosts
+	log "R2 stunnel 127.0.0.1:8444 -> $blob_ip_r2:443"
+
+	backup_url_r2=/etc/foundationdb/backup-url-r2
+	umask 077
+	printf 'blobstore://%s@%s:8444/%s?bucket=%s&region=%s&sc=0\n' \
+		"$R2_ACCESS_KEY_ID" "$blob_host_r2" "${WEFT_BACKUP_NAME:-weft}" \
+		"${R2_BUCKET:-weftspun-fdb-dr}" "${R2_REGION:-auto}" > "$backup_url_r2"
+	umask 022
+	chmod 0600 "$backup_url_r2"
+
+	log "R2 backup url in $backup_url_r2 -- fdbbackup start -t dr -d \"\$(cat $backup_url_r2)\""
+else
+	log "no R2 blob store: DR tag is not configured on this machine"
 fi
 
 conf=/etc/foundationdb/foundationdb.conf
@@ -389,12 +443,27 @@ conf=/etc/foundationdb/foundationdb.conf
 	# One agent for each machine. Any number of agents pointed at the same database cooperate
 	# on one backup, so this is throughput rather than redundancy, and a machine that is down
 	# takes its agent with it either way.
-	if [ "$backup" = 1 ]; then
+	# Gate the agent block on EITHER destination being wired, not just Tigris.
+	# An R2-only setup -- the DR path RFD 2143 describes -- otherwise spawns no
+	# agent at all, and `fdbrestore` queues forever with no worker. RFD 2144
+	# defect #6 caught this the hard way; the negative control is a machine
+	# started with R2_* only, where `pgrep backup_agent` returns at least one pid.
+	if [ "$backup" = 1 ] || [ "$backup_r2" = 1 ]; then
+		# The credentials file the agent reads. When both destinations exist,
+		# FoundationDB accepts multiple files separated by ':' and picks the
+		# entry whose account key matches the URL at connect time.
+		if [ "$backup" = 1 ] && [ "$backup_r2" = 1 ]; then
+			creds="$blob_creds:$blob_creds_r2"
+		elif [ "$backup" = 1 ]; then
+			creds="$blob_creds"
+		else
+			creds="$blob_creds_r2"
+		fi
 		echo ""
 		echo "[backup_agent]"
 		echo "command = /usr/lib/foundationdb/backup_agent/backup_agent"
 		echo "logdir = /var/log/foundationdb"
-		echo "blob_credentials = $blob_creds"
+		echo "blob_credentials = $creds"
 		# The blob store rides the loopback hop now, so the resolver preferences and the blob
 		# trust additions this section used to carry are gone with the direct dial.
 		# SigV4, because the endpoint behind the stunnel hop refuses SigV2, and
@@ -408,6 +477,12 @@ conf=/etc/foundationdb/foundationdb.conf
 		fi
 		echo ""
 		echo "[backup_agent.1]"
+		# A second agent for the DR tag. Backup agents cooperate on any tag the
+		# database is running, so this is one more worker rather than a mirror.
+		if [ "$backup" = 1 ] && [ "$backup_r2" = 1 ]; then
+			echo ""
+			echo "[backup_agent.2]"
+		fi
 	fi
 } > "$conf"
 log "$PROCS processes from port $PORT"
@@ -434,7 +509,7 @@ log "cluster health gate on :8081/cluster"
 # other two machines.
 lowest=$(printf '%s\n' "$peers" | sort | head -1)
 if [ "$self" = "$lowest" ]; then
-	log "lowest address, so this machine configures the database"
+	log "lowest address, so this machine configures the database and starts backup tags"
 	waited=0
 	while [ "$waited" -lt 120 ]; do
 		if fdbcli --exec 'status minimal' 2>&1 | grep -q 'The database is available'; then
@@ -450,6 +525,38 @@ if [ "$self" = "$lowest" ]; then
 		waited=$((waited + 5))
 	done
 	fdbcli --exec 'status minimal' 2>&1 | sed 's/^/[entrypoint] /' || true
+
+	# Start the DR tag once. `fdbbackup start` refuses to overlay a running
+	# tag ("already exists"), so gate on `fdbbackup status -t dr` reporting
+	# no backup. The refusal case is the normal case on every restart after
+	# the first; guarding it keeps the log meaningful when it does fire.
+	if [ "$backup_r2" = 1 ]; then
+		st=$(fdbcli --exec 'status minimal' 2>&1)
+		case "$st" in
+			*'database is available'*)
+				out=$(fdbbackup status -t dr 2>&1 || true)
+				case "$out" in
+					*'No previous backups found'*|*'The previous backup on tag'*'terminated'*|*'has been submitted for termination'*)
+						log "starting DR backup: fdbbackup start -t dr"
+						fdbbackup start -t dr -z \
+							-d "$(cat "$backup_url_r2")" \
+							--blob-credentials "$blob_creds_r2" \
+							--knob_http_request_aws_v4_header=true 2>&1 \
+							| sed 's/^/[entrypoint] fdbbackup dr: /'
+						;;
+					*'is restorable'*|*'submitted'*)
+						log "DR backup already running"
+						;;
+					*)
+						log "DR backup status unclear, not starting: $out"
+						;;
+				esac
+				;;
+			*)
+				log "DB not available yet for DR start"
+				;;
+		esac
+	fi
 fi
 
 wait "$monitor"
