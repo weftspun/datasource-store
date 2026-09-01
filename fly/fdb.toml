@@ -25,7 +25,11 @@ primary_region = "sjc"
   # default would form a smaller cluster that reports itself healthy. Change this and the
   # machine count together.
   WEFT_FDB_MACHINES   = "3"
-  WEFT_FDB_REDUNDANCY = "double"
+  # Redundancy dropped from `double` to `single` on 2026-08-31: the cluster carries
+  # 0 MB of user data and the DR path via R2 is being wired up in RFD 2143, so
+  # losing one machine is a cheaper trade than paying to keep the copy. Fault
+  # tolerance is 0 machines. Restore to `double` before real data lands.
+  WEFT_FDB_REDUNDANCY = "single"
   WEFT_FDB_STORAGE    = "ssd-2"
   WEFT_FDB_PROCS      = "2"
   WEFT_FDB_DATA       = "/data"
@@ -71,6 +75,22 @@ primary_region = "sjc"
     timeout = "10s"
     grace_period = "10m"
 
+  # The DR-tag freshness gate, per RFD 2143. Publishes /dr from the second
+  # backup-fresh loop, and fails critical when the R2 tag stops running or
+  # its newest log is older than WEFT_BACKUP_MAX_AGE -- the same threshold
+  # backup_fresh uses for the Tigris tag.
+  [checks.backup_fresh_dr]
+    type = "http"
+    port = 8081
+    path = "/dr"
+    interval = "2m"
+    timeout = "10s"
+    # Long grace because the DR tag is started lazily by whichever machine
+    # wins the idempotent guard, and the first-ever start can wait behind a
+    # cluster reconfiguration or a cold R2 handshake. Ordinary running steady
+    # state refreshes every 5 minutes.
+    grace_period = "30m"
+
   # The roll gate: fails until the data state is healthy and a zone can be
   # lost without losing data, so a rolling deploy waits out re-replication
   # after each machine restart -- the Kubernetes FDB operator's behaviour,
@@ -90,7 +110,12 @@ primary_region = "sjc"
   policy = "on-failure"
   retries = 3
 
+# Memory is sized to measurement rather than to FoundationDB's recommendation: on
+# 2026-08-31 a node held 302 MB of 1968 MB, the two fdbservers at 112 MB and 99 MB
+# RSS, so 1 GB leaves ~700 MB of headroom. `cpus` is not free to shrink with it --
+# fdbserver is single-threaded, so WEFT_FDB_PROCS above is one process per core, and
+# a core removed here puts two of them in contention on one.
 [[vm]]
-  memory   = "2gb"
+  memory   = "1gb"
   cpu_kind = "shared"
   cpus     = 2

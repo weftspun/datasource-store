@@ -45,6 +45,11 @@ self_test() {
 	echo "ok   4 of 4 controls fired"
 }
 
+TAG=""
+if [ "${1:-}" = "--tag" ]; then
+	TAG="${2:?--tag needs a value}"
+fi
+
 if [ "${1:-}" = "--self-test" ]; then
 	self_test
 	exit $?
@@ -53,20 +58,72 @@ fi
 self_test || exit 1
 mkdir -p "$HEALTH_DIR"
 
+# The health file this loop maintains. Default tag writes /health, so today's
+# fly.toml [checks.backup_fresh] keeps polling the same URL. A named tag writes
+# /$TAG -- fly.toml adds one [checks.backup_fresh_$TAG] per tag it wants gated.
+HEALTH_FILE="$HEALTH_DIR/${TAG:-health}"
+
 while :; do
-	json=$(timeout 30 fdbcli \
-		--tls_certificate_file /etc/foundationdb/tls/cert.pem \
-		--tls_key_file /etc/foundationdb/tls/key.pem \
-		--tls_ca_file /etc/foundationdb/tls/ca.pem \
-		--tls_verify_peers "$VERIFY" \
-		--exec "status json" 2>/dev/null || true)
-	running=$(printf '%s' "$json" | grep -oE '"running_backup"[^,}]*' | grep -oE 'true|false' | head -1)
-	behind=$(printf '%s' "$json" | grep -oE '"last_restorable_seconds_behind"[^,}]*' | grep -oE '[0-9.]+' | head -1)
-	if [ "$(verdict "${running:-false}" "${behind:-x}")" = fresh ]; then
-		echo ok > "$HEALTH_DIR/health"
+	if [ -z "$TAG" ]; then
+		# The default tag reads `status json`, because those cluster-wide
+		# fields are what have always been checked and there is no reason
+		# to change what the existing gate is measuring.
+		json=$(timeout 30 fdbcli \
+			--tls_certificate_file /etc/foundationdb/tls/cert.pem \
+			--tls_key_file /etc/foundationdb/tls/key.pem \
+			--tls_ca_file /etc/foundationdb/tls/ca.pem \
+			--tls_verify_peers "$VERIFY" \
+			--exec "status json" 2>/dev/null || true)
+		running=$(printf '%s' "$json" | grep -oE '"running_backup"[^,}]*' | grep -oE 'true|false' | head -1)
+		behind=$(printf '%s' "$json" | grep -oE '"last_restorable_seconds_behind"[^,}]*' | grep -oE '[0-9.]+' | head -1)
 	else
-		rm -f "$HEALTH_DIR/health"
-		echo "[backup-fresh] BACKUP STALE: running=${running:-unreadable} seconds_behind=${behind:-unreadable} max=${MAX_BEHIND}" >&2
+		# A named tag reads `fdbbackup status -t $TAG`. The text carries
+		# per-tag state -- the cluster status json does not -- and two
+		# fields are enough: whether the tag is restorable, and how old
+		# its newest complete log is. "restorable" is the running flag;
+		# the log-age difference is the seconds-behind.
+		out=$(timeout 30 fdbbackup status -t "$TAG" \
+			--tls_certificate_file /etc/foundationdb/tls/cert.pem \
+			--tls_key_file /etc/foundationdb/tls/key.pem \
+			--tls_ca_file /etc/foundationdb/tls/ca.pem \
+			--tls_verify_peers "$VERIFY" 2>/dev/null || true)
+		# The tag is "running" for freshness purposes in any state where
+		# `fdbbackup` reports it exists and is not paused or aborted --
+		# "submitted", "in progress" (initial snapshot uploading) and
+		# "restorable" all mean the agents are active. A first-time
+		# rollout otherwise blocks the health check for the whole initial
+		# snapshot upload, which stalls the Fly deploy gate.
+		case "$out" in
+			*restorable*|*"is in progress"*|*"submitted"*) running=true ;;
+			*) running=false ;;
+		esac
+		# "Last complete log version and timestamp - 95759830628, 2026/09/01.01:24:21+0000"
+		ts=$(printf '%s' "$out" | grep -oE 'Last complete log version and timestamp[^,]*, [0-9/.:+-]+' | awk -F', ' '{print $2}' | head -1)
+		if [ -n "$ts" ]; then
+			# Convert 2026/09/01.01:24:21+0000 to a POSIX time.
+			epoch=$(date -u -d "$(printf '%s' "$ts" | sed 's|/|-|g; s|\.| |')" +%s 2>/dev/null || echo "")
+			if [ -n "$epoch" ]; then
+				now=$(date -u +%s)
+				behind=$(( now - epoch ))
+			else
+				behind=""
+			fi
+		elif [ "$running" = true ]; then
+			# A running tag with no complete log timestamp yet is a
+			# tag mid-initial-snapshot, not a stale tag. Report 0
+			# lag so the freshness gate does not fire during first
+			# upload; a subsequent poll picks up the real timestamp
+			# once the first log finalizes.
+			behind=0
+		else
+			behind=""
+		fi
+	fi
+	if [ "$(verdict "${running:-false}" "${behind:-x}")" = fresh ]; then
+		echo ok > "$HEALTH_FILE"
+	else
+		rm -f "$HEALTH_FILE"
+		echo "[backup-fresh${TAG:+ $TAG}] BACKUP STALE: running=${running:-unreadable} seconds_behind=${behind:-unreadable} max=${MAX_BEHIND}" >&2
 	fi
 	sleep "$CHECK_EVERY"
 done
